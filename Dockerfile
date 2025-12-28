@@ -35,9 +35,12 @@ WORKDIR /app
 
 # Copy the built binary from the builder stage
 COPY --from=builder /app/pyramid-exe ./pyramid-exe
+COPY entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
 
 ENV HOST="0.0.0.0"
 ENV PORT="3334"
 ENV DATA_PATH="./data"
 
+ENTRYPOINT ["./entrypoint.sh"]
 CMD ["./pyramid-exe"]
