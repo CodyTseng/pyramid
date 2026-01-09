@@ -1,5 +1,5 @@
 #!/bin/sh
-LOCK_FILE=/app/data/mmmm.lock
+LOCK_FILE=/data/mmmm.lock
 
 if [ -f "$LOCK_FILE" ]; then
   echo "Removing stale lock file"
