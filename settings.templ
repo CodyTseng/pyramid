@@ -247,7 +247,10 @@ templ settingsPage(loggedUser nostr.PubKey) {
 				class="space-y-6 mt-8"
 				x-data={ `{
 					maxInvitesPerPerson: ` + fmt.Sprint(global.Settings.MaxInvitesPerPerson) + `,
+					maxEventSize: ` + fmt.Sprint(global.Settings.MaxEventSize) + `,
 					requireCurrentTimestamp: ` + fmt.Sprint(global.Settings.RequireCurrentTimestamp) + `,
+					enableOTS: ` + fmt.Sprint(global.Settings.EnableOTS) + `,
+					acceptFutureEvents: ` + fmt.Sprint(global.Settings.AcceptScheduledEvents) + `,
 					browseUri: '` + global.Settings.BrowseURI + `',
 					linkUrl: '` + global.Settings.LinkURL + `',
 					saved: false,
@@ -266,19 +269,31 @@ templ settingsPage(loggedUser nostr.PubKey) {
 			>
 				@layout.SubSectionTitle("general")
 				<div class="space-y-4">
-					<div class="flex items-center">
-						<input
-							type="checkbox"
-							name="require_current_timestamp"
-							id="require_current_timestamp"
-							class="w-4 h-6 rounded border-stone-300 dark:border-stone-600"
-							x-model="requireCurrentTimestamp"
-							@change="saveSettings()"
-						/>
-						<label for="require_current_timestamp" class="ml-2 text-sm font-medium dark:text-stone-300">
+					<div class="flex justify-between gap-4 items-center">
+						<label for="require_current_timestamp" class="text-sm dark:text-stone-300 flex items-center">
+							<input
+								type="checkbox"
+								name="require_current_timestamp"
+								id="require_current_timestamp"
+								class="w-4 h-6 rounded border-stone-300 dark:border-stone-600 mr-2"
+								x-model="requireCurrentTimestamp"
+								@change="saveSettings()"
+							/>
 							require event timestamps to be current (within ±60 seconds)
 						</label>
 						<input type="hidden" name="require_current_timestamp" value="off"/>
+						<label for="accept_scheduled_events" class="text-sm dark:text-stone-300 flex items-center">
+							<input
+								type="checkbox"
+								name="accept_scheduled_events"
+								id="accept_scheduled_events"
+								class="w-4 h-6 rounded border-stone-300 dark:border-stone-600 mr-2"
+								x-model="acceptFutureEvents"
+								@change="saveSettings()"
+							/>
+							accept scheduled events
+						</label>
+						<input type="hidden" name="accept_scheduled_events" value="off"/>
 					</div>
 					<div>
 						<label class="block text-sm font-medium mb-2 dark:text-stone-300">max invites per person</label>
@@ -292,6 +307,31 @@ templ settingsPage(loggedUser nostr.PubKey) {
 						/>
 					</div>
 					<div>
+						<label class="block text-sm font-medium mb-2 dark:text-stone-300">max event size (in bytes)</label>
+						<input
+							type="number"
+							name="max_event_size"
+							min="1"
+							class="w-full px-4 py-2 rounded border border-stone-300 dark:border-stone-600 bg-white dark:bg-stone-700 dark:text-stone-100"
+							x-model="maxEventSize"
+							@blur="saveSettings()"
+						/>
+					</div>
+					<div class="flex items-center">
+						<input
+							type="checkbox"
+							name="enable_ots"
+							id="enable_ots"
+							class="w-4 h-6 rounded border-stone-300 dark:border-stone-600"
+							x-model="enableOTS"
+							@change="saveSettings()"
+						/>
+						<label for="enable_ots" class="ml-2 text-sm dark:text-stone-300">
+							automatically NIP-03 <a class="underline underline-offset-4 hover:font-medium" href="https://opentimestamps.org/" target="_blank">OpenTimestamp</a> every event published here (only certain kinds eligible)
+						</label>
+						<input type="hidden" name="enable_ots" value="off"/>
+					</div>
+					<div>
 						<label class="block text-sm font-medium mb-2 dark:text-stone-300">URL pattern for the relay "browse" links</label>
 						<div class="flex flex-wrap gap-2 items-center">
 							<input
@@ -303,7 +343,7 @@ templ settingsPage(loggedUser nostr.PubKey) {
 							/>
 							<button
 								type="button"
-								@mousedown="browseUri = 'https://jumble.social/?r=__URL__'"
+								@mousedown="browseUri = 'https://jumble.social/?r={url}'"
 								@mouseup="saveSettings()"
 								class="px-3 py-1 text-sm rounded bg-stone-200 hover:bg-stone-300 dark:bg-stone-600 dark:hover:bg-stone-500"
 							>
@@ -311,7 +351,7 @@ templ settingsPage(loggedUser nostr.PubKey) {
 							</button>
 							<button
 								type="button"
-								@mousedown="browseUri = 'https://yakihonne.com/r/content?r=__URL__'"
+								@mousedown="browseUri = 'https://yakihonne.com/r/content?r={url}'"
 								@mouseup="saveSettings()"
 								class="px-3 py-1 text-sm rounded bg-stone-200 hover:bg-stone-300 dark:bg-stone-600 dark:hover:bg-stone-500"
 							>
@@ -319,7 +359,7 @@ templ settingsPage(loggedUser nostr.PubKey) {
 							</button>
 							<button
 								type="button"
-								@mousedown="browseUri = 'https://nosotros.app/feed?relay=__URL__&kind=1&limit=30&type=relayfeed'"
+								@mousedown="browseUri = 'https://nosotros.app/feed?relay={url}&kind=1&limit=30&type=relayfeed'"
 								@mouseup="saveSettings()"
 								class="px-3 py-1 text-sm rounded bg-stone-200 hover:bg-stone-300 dark:bg-stone-600 dark:hover:bg-stone-500"
 							>
@@ -327,7 +367,7 @@ templ settingsPage(loggedUser nostr.PubKey) {
 							</button>
 							<button
 								type="button"
-								@mousedown="browseUri = 'https://coracle.social/relays/__URL__'"
+								@mousedown="browseUri = 'https://coracle.social/relays/{url}'"
 								@mouseup="saveSettings()"
 								class="px-3 py-1 text-sm rounded bg-stone-200 hover:bg-stone-300 dark:bg-stone-600 dark:hover:bg-stone-500"
 							>
@@ -495,20 +535,6 @@ templ settingsPage(loggedUser nostr.PubKey) {
 					saved!
 				</div>
 			</form>
-			<!-- cleanup Section -->
-			<div class="mt-8">
-				@layout.SubSectionTitle("cleanup")
-				<p class="text-sm text-stone-600 dark:text-stone-400 mb-4">
-					permanently delete all events from users not in the pyramid.
-				</p>
-				<a
-					href="/cleanup"
-					class="inline-block px-4 py-2 rounded text-white font-medium themed:bg-[var(--extra-color)] themed:hover:bg-[rgb(from_var(--extra-color)_r_g_b_/_80%)] unthemed:bg-blue-600 unthemed:hover:bg-blue-700"
-					onclick="return confirm('are you sure you want to delete all events from non-members? this cannot be undone.')"
-				>
-					clear stuff from excluded users
-				</a>
-			</div>
 			<!-- update Section -->
 			<div
 				class="mt-8"
@@ -554,7 +580,7 @@ templ settingsPage(loggedUser nostr.PubKey) {
 				@layout.SubSectionTitle("update")
 				<p class="text-sm text-stone-600 dark:text-stone-400 mb-4">
 					<div>current version: <span class="text-stone-600 dark:text-stone-400" x-ref="currentVersion">{ currentVersion }</span></div>
-					<div>latest version: <span class="text-stone-600 dark:text-stone-400" x-ref="latestVersion"><a href={ templ.SafeURL("https://github.com/fiatjaf/pyramid/releases/tag/" + latestVersion.name) } target="_blank">{ latestVersion.name }</a></span></div>
+					<div>latest version: <span class="text-stone-600 dark:text-stone-400" x-ref="latestVersion"><a class="hover:font-medium underline underline-offset-4" href={ templ.SafeURL("https://github.com/fiatjaf/pyramid/releases/tag/" + latestVersion.name) } target="_blank">{ latestVersion.name }</a></span></div>
 				</p>
 				<div class="mt-2">
 					<button

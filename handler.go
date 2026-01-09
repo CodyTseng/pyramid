@@ -13,7 +13,9 @@ import (
 	"strings"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore/mmm"
 	"fiatjaf.com/nostr/nip05"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/fiatjaf/pyramid/favorites"
 	"github.com/fiatjaf/pyramid/global"
@@ -48,7 +50,7 @@ func actionHandler(w http.ResponseWriter, r *http.Request) {
 		type_ = pyramid.ActionLeave
 	}
 	author, _ := global.GetLoggedUser(r)
-	target := pubkeyFromInput(r.PostFormValue("target"))
+	target := global.PubKeyFromInput(r.PostFormValue("target"))
 
 	if err := pyramid.AddAction(type_, author, target); err != nil {
 		http.Error(w, err.Error(), 403)
@@ -59,35 +61,8 @@ func actionHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", 302)
 }
 
-// this deletes all events from users not in the relay anymore
-func cleanupStuffFromExcludedUsersHandler(w http.ResponseWriter, r *http.Request) {
-	loggedUser, _ := global.GetLoggedUser(r)
-
-	if !pyramid.IsRoot(loggedUser) {
-		http.Error(w, "unauthorized, only the relay owner can do this", 403)
-		return
-	}
-
-	count := 0
-	for evt := range global.IL.Main.QueryEvents(nostr.Filter{}, 99999999) {
-		if pyramid.IsMember(evt.PubKey) {
-			continue
-		}
-
-		if err := global.IL.Main.DeleteEvent(evt.ID); err != nil {
-			http.Error(w, fmt.Sprintf(
-				"failed to delete %s: %s -- stopping, %d events were deleted before this error", evt, err, count), 500)
-			return
-		}
-		count++
-	}
-
-	fmt.Fprintf(w, "deleted %d events", count)
-}
-
 func settingsHandler(w http.ResponseWriter, r *http.Request) {
 	loggedUser, _ := global.GetLoggedUser(r)
-
 	if !pyramid.IsRoot(loggedUser) {
 		http.Error(w, "unauthorized", 403)
 		return
@@ -136,6 +111,10 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.LinkURL = v[0]
 			case "require_current_timestamp":
 				global.Settings.RequireCurrentTimestamp = v[0] == "on"
+			case "enable_ots":
+				global.Settings.EnableOTS = v[0] == "on"
+			case "accept_future_events":
+				global.Settings.AcceptScheduledEvents = v[0] == "on"
 			case "paywall_tag":
 				global.Settings.Paywall.Tag = v[0]
 			case "paywall_amount":
@@ -266,7 +245,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					if s == "" {
 						continue
 					}
-					pk := pubkeyFromInput(s)
+					pk := global.PubKeyFromInput(s)
 					if pk != nostr.ZeroPK && !slices.Contains(blocked, pk) {
 						blocked = append(blocked, pk)
 					}
@@ -501,7 +480,7 @@ func rootUserSetupHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		pubkeyStr := r.PostFormValue("pubkey")
-		target := pubkeyFromInput(pubkeyStr)
+		target := global.PubKeyFromInput(pubkeyStr)
 
 		if target == nostr.ZeroPK {
 			http.Error(w, "invalid public key", 400)
@@ -569,16 +548,9 @@ func forumHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func memberPageHandler(w http.ResponseWriter, r *http.Request) {
-	loggedUser, _ := global.GetLoggedUser(r)
-
-	if !pyramid.IsMember(loggedUser) {
-		http.Error(w, "unauthorized", 401)
-		return
-	}
+	loggedUser, isLogged := global.GetLoggedUser(r)
 
 	if r.Method == http.MethodPost {
-		r.ParseForm()
-
 		if nip05Username := r.PostFormValue("nip05_username"); nip05Username != "" {
 			// basic validation for NIP-05 username (alphanumeric and underscores only)
 			nip05Username = strings.ToLower(nip05Username)
@@ -613,6 +585,23 @@ func memberPageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var user nostr.PubKey
+
+	pubkeyHex := r.PathValue("pubkey")
+	if pubkeyHex == "" && isLogged {
+		http.Redirect(w, r, "/u/"+nip19.EncodeNpub(loggedUser), 302)
+		return
+	} else if pubkeyHex != "" {
+		user = global.PubKeyFromInput(pubkeyHex)
+		if user == nostr.ZeroPK {
+			http.Error(w, "invalid pubkey", 400)
+			return
+		}
+	} else {
+		http.Redirect(w, r, "/", 302)
+		return
+	}
+
 	var nip05 string
 	for name, pubkey := range global.Settings.NIP05.Names {
 		if pubkey == loggedUser {
@@ -621,7 +610,49 @@ func memberPageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	memberPage(loggedUser, nip05).Render(r.Context(), w)
+	// compute user-specific stats
+	var mainStats mmm.EventStats
+	if pyramid.IsMember(loggedUser) {
+		mainStats, _ = global.IL.Main.ComputeStats(mmm.StatsOptions{OnlyPubKey: user})
+	}
+
+	memberPage(loggedUser, user, nip05, mainStats).Render(r.Context(), w)
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	loggedUser, _ := global.GetLoggedUser(r)
+
+	if !pyramid.IsMember(loggedUser) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// compute stats for all IndexingLayer instances
+	mainStats, _ := global.IL.Main.ComputeStats(mmm.StatsOptions{})
+	systemStats, _ := global.IL.System.ComputeStats(mmm.StatsOptions{})
+	groupsStats, _ := global.IL.Groups.ComputeStats(mmm.StatsOptions{})
+	favoritesStats, _ := global.IL.Favorites.ComputeStats(mmm.StatsOptions{})
+	internalStats, _ := global.IL.Internal.ComputeStats(mmm.StatsOptions{})
+	moderatedStats, _ := global.IL.Moderated.ComputeStats(mmm.StatsOptions{})
+	popularStats, _ := global.IL.Popular.ComputeStats(mmm.StatsOptions{})
+	uppermostStats, _ := global.IL.Uppermost.ComputeStats(mmm.StatsOptions{})
+	inboxStats, _ := global.IL.Inbox.ComputeStats(mmm.StatsOptions{})
+
+	StatsPage(loggedUser, mainStats, systemStats, groupsStats, favoritesStats, internalStats, moderatedStats, popularStats, uppermostStats, inboxStats).Render(r.Context(), w)
+}
+
+func syncHandler(w http.ResponseWriter, r *http.Request) {
+	loggedUser, _ := global.GetLoggedUser(r)
+	if !pyramid.IsMember(loggedUser) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	remoteUrl := r.FormValue("remote")
+	download := r.FormValue("download") == "on"
+	upload := r.FormValue("upload") == "on"
+
+	streamingSync(r.Context(), loggedUser, remoteUrl, download, upload, w)
 }
 
 func nip05Handler(w http.ResponseWriter, r *http.Request) {

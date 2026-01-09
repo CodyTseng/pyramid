@@ -36,7 +36,10 @@ type UserSettings struct {
 	BrowseURI               string `json:"browse_uri"`
 	LinkURL                 string `json:"link_url"`
 	MaxInvitesPerPerson     int    `json:"max_invites_per_person"`
+	MaxEventSize            int    `json:"max_event_size"`
 	RequireCurrentTimestamp bool   `json:"require_current_timestamp"`
+	EnableOTS               bool   `json:"enable_ots"`
+	AcceptScheduledEvents   bool   `json:"accept_future_events"`
 
 	Paywall struct {
 		Tag        string `json:"tag"`
@@ -76,6 +79,10 @@ type UserSettings struct {
 	Grasp struct {
 		Enabled bool `json:"enabled"`
 	} `json:"grasp"`
+
+	Blossom struct {
+		Enabled bool `json:"enabled"`
+	} `json:"blossom"`
 
 	Popular struct {
 		RelayMetadata
@@ -124,7 +131,7 @@ func (rm RelayMetadata) GetDescription() string {
 	case "favorites":
 		return "relay members can manually republish notes here and they'll be saved."
 	case "inbox":
-		return "filtered notifications for relay members using unified web of trust filtering. only see mentions from people in the combined relay extended network."
+		return "filtered notifications for relay members using unified web-of-trust filtering. only see mentions from people in the combined relay extended network."
 	case "popular":
 		return "auto-curated popular posts from relay members. this is a read-only relay where events are automatically fetched from other relays and saved based reactions, replies, favorites and zaps created by members."
 	case "uppermost":
@@ -181,12 +188,15 @@ func getUserSettingsPath() string {
 func loadUserSettings() error {
 	// start it with the defaults
 	Settings = UserSettings{
-		BrowseURI:               "https://fevela.me/?r=__URL__",
+		BrowseURI:               "https://fevela.me/?r={url}",
 		LinkURL:                 "nostr:{code}",
 		MaxInvitesPerPerson:     4,
+		MaxEventSize:            10000,
 		RequireCurrentTimestamp: true,
+		EnableOTS:               true,
 		BlockedIPs:              []string{},
 	}
+
 	Settings.Inbox.Enabled = true
 	Settings.Internal.Enabled = true
 	Settings.Favorites.Enabled = true
@@ -245,6 +255,9 @@ func loadUserSettings() error {
 	if err := json.Unmarshal(data, &Settings); err != nil {
 		return err
 	}
+
+	// temporary: replace {url} in settings
+	Settings.BrowseURI = strings.ReplaceAll(Settings.BrowseURI, "__URL__", "{url}")
 
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/FastFilter/xorfilter"
 	"github.com/fiatjaf/pyramid/global"
 	"github.com/fiatjaf/pyramid/pyramid"
+	"github.com/puzpuzpuz/xsync/v3"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -37,7 +38,7 @@ func computeAggregatedWoT(ctx context.Context) (WotXorFilter, error) {
 		members = append(members, k)
 	}
 
-	queue := make(map[nostr.PubKey]struct{}, len(members)*100)
+	queue := xsync.NewMapOf[nostr.PubKey, struct{}](xsync.WithPresize(len(members) * 200))
 	wg := sync.WaitGroup{}
 	sem := semaphore.NewWeighted(15)
 
@@ -57,7 +58,7 @@ func computeAggregatedWoT(ctx context.Context) (WotXorFilter, error) {
 					continue
 				}
 
-				queue[f.Pubkey] = struct{}{}
+				queue.Store(f.Pubkey, struct{}{})
 			}
 		})
 	}
@@ -65,28 +66,39 @@ func computeAggregatedWoT(ctx context.Context) (WotXorFilter, error) {
 	wg.Wait()
 
 	res := make(chan nostr.PubKey)
+	all := sync.WaitGroup{}
 
-	log.Info().Int("n", len(queue)).Msg("fetching secondary follow lists for follows")
-	for user := range queue {
-		if err := sem.Acquire(ctx, 1); err != nil {
-			return WotXorFilter{}, fmt.Errorf("failed to acquire: %w", err)
-		}
-
+	log.Info().Int("n", queue.Size()).Msg("fetching secondary follow lists for follows")
+	for user := range queue.Range {
+		all.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(ctx, time.Second*7)
-			defer cancel()
-			defer sem.Release(1)
-
-			res <- user
-			for _, f := range global.Nostr.FetchFollowList(ctx, user).Items {
-				if slices.Contains(global.Settings.Inbox.SpecificallyBlocked, f.Pubkey) {
-					continue
-				}
-
-				res <- f.Pubkey
+			if err := sem.Acquire(ctx, 1); err != nil {
+				log.Error().Err(err).Msg("failed to acquire semaphore on wot building")
 			}
+
+			go func() {
+				ctx, cancel := context.WithTimeout(ctx, time.Second*7)
+				defer cancel()
+
+				fl := global.Nostr.FetchFollowList(ctx, user).Items
+				sem.Release(1)
+
+				res <- user
+				for _, f := range fl {
+					if slices.Contains(global.Settings.Inbox.SpecificallyBlocked, f.Pubkey) {
+						continue
+					}
+					res <- f.Pubkey
+				}
+				all.Done()
+			}()
 		}()
 	}
+
+	go func() {
+		all.Wait()
+		close(res)
+	}()
 
 	return makeWoTFilter(res), nil
 }
@@ -102,11 +114,11 @@ func makeWoTFilter(m chan nostr.PubKey) WotXorFilter {
 		}
 	}
 
+	log.Info().Int("n", len(shids)).Msg("finishing wot xor filter")
 	if len(shids) == 0 {
 		return WotXorFilter{}
 	}
 
-	log.Info().Int("n", len(shids)).Msg("finishing wot xor filter")
 	xf, err := xorfilter.Populate(shids)
 	if err != nil {
 		nostr.InfoLogger.Println("failed to populate filter", len(shids), err)

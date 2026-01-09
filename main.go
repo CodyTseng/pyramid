@@ -23,6 +23,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/fiatjaf/pyramid/blossom"
 	"github.com/fiatjaf/pyramid/favorites"
 	"github.com/fiatjaf/pyramid/global"
 	"github.com/fiatjaf/pyramid/grasp"
@@ -58,6 +59,17 @@ func main() {
 		}
 	}()
 
+	// start periodic checking of opentimestamps proofs
+	go func() {
+		time.Sleep(time.Minute * 3)
+		if err := initOTS(); err == nil {
+			for {
+				checkOTS(context.Background())
+				time.Sleep(time.Hour * 2)
+			}
+		}
+	}()
+
 	pyramid.AbsoluteKey = global.Settings.RelayInternalSecretKey.Public()
 
 	if err := pyramid.LoadManagement(); err != nil {
@@ -85,9 +97,11 @@ func main() {
 
 	// init basic http routes
 	relay.Router().HandleFunc("/action", actionHandler)
-	relay.Router().HandleFunc("/cleanup", cleanupStuffFromExcludedUsersHandler)
 	relay.Router().HandleFunc("/settings", settingsHandler)
-	relay.Router().HandleFunc("/member", memberPageHandler)
+	relay.Router().HandleFunc("/u", memberPageHandler)
+	relay.Router().HandleFunc("/u/{pubkey}", memberPageHandler)
+	relay.Router().HandleFunc("/u/sync", syncHandler)
+	relay.Router().HandleFunc("/stats", statsHandler)
 	relay.Router().HandleFunc("/update", updateHandler)
 	relay.Router().HandleFunc("/icon/{relayId}", iconHandler)
 	relay.Router().HandleFunc("/forum/", forumHandler)
@@ -103,14 +117,17 @@ func main() {
 	relay.Router().HandleFunc("/{$}", inviteTreeHandler)
 
 	// init sub relays
-	favorites.Init()
 	grasp.Init(relay)
 	groups.Init(relay)
+	blossom.Init(relay)
+	favorites.Init()
 	inbox.Init()
 	internal.Init()
 	moderated.Init()
 	popular.Init()
 	uppermost.Init()
+
+	initScheduledRelay()
 
 	// setup main relay hooks and so on
 	relay.QueryStored = queryStored
@@ -122,6 +139,10 @@ func main() {
 		if event.Tags.Find("h") != nil {
 			// nip29 logic
 			return global.IL.Groups.SaveEvent(event)
+		} else if global.Settings.AcceptScheduledEvents && event.CreatedAt > nostr.Now()+60 {
+			// future scheduled events
+			scheduled.BroadcastEvent(event)
+			return global.IL.Scheduled.SaveEvent(event)
 		} else {
 			// normal logic
 			return global.IL.Main.SaveEvent(event)
@@ -137,11 +158,15 @@ func main() {
 		}
 	}
 	relay.DeleteEvent = func(ctx context.Context, id nostr.ID) error {
-		// try to delete from both
+		// try to delete from everywhere
 		if err := global.IL.Main.DeleteEvent(id); err != nil {
 			return err
 		}
+		// TODO: prevent deleting from group if too much time has passed
 		if err := global.IL.Groups.DeleteEvent(id); err != nil {
+			return err
+		}
+		if err := global.IL.Scheduled.DeleteEvent(id); err != nil {
 			return err
 		}
 		return nil
@@ -188,7 +213,7 @@ func main() {
 	)
 	relay.RejectConnection = policies.ConnectionRateLimiter(1, time.Minute*5, 30)
 	relay.OnEvent = func(ctx context.Context, event nostr.Event) (reject bool, msg string) {
-		if len(event.Content) > 10_000 {
+		if len(event.Content) > global.Settings.MaxEventSize {
 			return true, "content is too big"
 		}
 
@@ -238,6 +263,14 @@ func main() {
 		case 0, 3, 10019:
 			global.IL.System.SaveEvent(event)
 		}
+
+		// trigger opentimestamping of selected event kinds
+		if global.Settings.EnableOTS {
+			switch event.Kind {
+			case 1, 11, 1111, 20, 21, 22, 24, 9802:
+				go triggerOTS(ctx, event)
+			}
+		}
 	}
 
 	relay.OnEphemeralEvent = func(ctx context.Context, event nostr.Event) {
@@ -255,6 +288,9 @@ func main() {
 	relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, 43)
 	if global.Settings.Groups.Enabled {
 		relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, 29)
+	}
+	if global.Settings.AcceptScheduledEvents {
+		relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, 16)
 	}
 	relay.ManagementAPI.AllowPubKey = allowPubKeyHandler
 	relay.ManagementAPI.BanEvent = banEventHandler
@@ -327,45 +363,35 @@ func start() {
 func run(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	mux.Handle("/"+global.Settings.Internal.HTTPBasePath+"/",
-		http.StripPrefix("/"+global.Settings.Internal.HTTPBasePath, internal.Relay))
-	mux.Handle("/"+global.Settings.Internal.HTTPBasePath,
-		http.StripPrefix("/"+global.Settings.Internal.HTTPBasePath, internal.Relay))
+	mux.Handle("/"+global.Settings.Internal.HTTPBasePath+"/", internal.Relay)
+	mux.Handle("/"+global.Settings.Internal.HTTPBasePath, internal.Relay)
 
-	mux.Handle("/"+global.Settings.Favorites.HTTPBasePath+"/",
-		http.StripPrefix("/"+global.Settings.Favorites.HTTPBasePath, favorites.Relay))
-	mux.Handle("/"+global.Settings.Favorites.HTTPBasePath,
-		http.StripPrefix("/"+global.Settings.Favorites.HTTPBasePath, favorites.Relay))
+	mux.Handle("/"+global.Settings.Favorites.HTTPBasePath+"/", favorites.Relay)
+	mux.Handle("/"+global.Settings.Favorites.HTTPBasePath, favorites.Relay)
 
-	mux.Handle("/grasp/",
-		http.StripPrefix("/grasp", grasp.Handler))
-	mux.Handle("/grasp",
-		http.StripPrefix("/grasp", grasp.Handler))
+	mux.Handle("/blossom/", blossom.Handler)
+	mux.Handle("/blossom", blossom.Handler)
 
-	mux.Handle("/groups/",
-		http.StripPrefix("/groups", groups.Handler))
-	mux.Handle("/groups",
-		http.StripPrefix("/groups", groups.Handler))
+	mux.Handle("/grasp/", grasp.Handler)
+	mux.Handle("/grasp", grasp.Handler)
 
-	mux.Handle("/"+global.Settings.Inbox.HTTPBasePath+"/",
-		http.StripPrefix("/"+global.Settings.Inbox.HTTPBasePath, inbox.Relay))
-	mux.Handle("/"+global.Settings.Inbox.HTTPBasePath,
-		http.StripPrefix("/"+global.Settings.Inbox.HTTPBasePath, inbox.Relay))
+	mux.Handle("/groups/", groups.Handler)
+	mux.Handle("/groups", groups.Handler)
 
-	mux.Handle("/"+global.Settings.Popular.HTTPBasePath+"/",
-		http.StripPrefix("/"+global.Settings.Popular.HTTPBasePath, popular.Relay))
-	mux.Handle("/"+global.Settings.Popular.HTTPBasePath,
-		http.StripPrefix("/"+global.Settings.Popular.HTTPBasePath, popular.Relay))
+	mux.Handle("/"+global.Settings.Inbox.HTTPBasePath+"/", inbox.Relay)
+	mux.Handle("/"+global.Settings.Inbox.HTTPBasePath, inbox.Relay)
 
-	mux.Handle("/"+global.Settings.Uppermost.HTTPBasePath+"/",
-		http.StripPrefix("/"+global.Settings.Uppermost.HTTPBasePath, uppermost.Relay))
-	mux.Handle("/"+global.Settings.Uppermost.HTTPBasePath,
-		http.StripPrefix("/"+global.Settings.Uppermost.HTTPBasePath, uppermost.Relay))
+	mux.Handle("/"+global.Settings.Popular.HTTPBasePath+"/", popular.Relay)
+	mux.Handle("/"+global.Settings.Popular.HTTPBasePath, popular.Relay)
 
-	mux.Handle("/"+global.Settings.Moderated.HTTPBasePath+"/",
-		http.StripPrefix("/"+global.Settings.Moderated.HTTPBasePath, moderated.Relay))
-	mux.Handle("/"+global.Settings.Moderated.HTTPBasePath,
-		http.StripPrefix("/"+global.Settings.Moderated.HTTPBasePath, moderated.Relay))
+	mux.Handle("/"+global.Settings.Uppermost.HTTPBasePath+"/", uppermost.Relay)
+	mux.Handle("/"+global.Settings.Uppermost.HTTPBasePath, uppermost.Relay)
+
+	mux.Handle("/"+global.Settings.Moderated.HTTPBasePath+"/", moderated.Relay)
+	mux.Handle("/"+global.Settings.Moderated.HTTPBasePath, moderated.Relay)
+
+	mux.Handle("/scheduled/", scheduled)
+	mux.Handle("/scheduled", scheduled)
 
 	mux.Handle("/", relay)
 
@@ -446,7 +472,7 @@ func run(ctx context.Context) error {
 
 func setupCheckMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/setup/") {
+		if strings.HasPrefix(r.URL.Path, "/setup/") || strings.HasPrefix(r.URL.Path, "/static/") {
 			next.ServeHTTP(w, r)
 			return
 		}

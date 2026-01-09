@@ -54,6 +54,7 @@ templ Layout(loggedUser nostr.PubKey, currentPage string) {
 			<link rel="stylesheet" href="/static/styles.css"/>
 			<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 			<script src="https://cdn.jsdelivr.net/npm/nostr-web-components@0.0.12/dist/nostr-name.js"></script>
+			<script src="https://cdn.jsdelivr.net/npm/nostr-web-components@0.0.12/dist/nostr-picture.js"></script>
 		</head>
 		<body
 			class="min-h-screen flex flex-col themed:bg-[var(--bg-color)] themed:text-[var(--base-color)] themed:font-[family-name:var(--secondary-font)] light:bg-stone-50 dark:bg-stone-900 light:text-stone-900 dark:text-stone-100"
@@ -94,20 +95,57 @@ templ Layout(loggedUser nostr.PubKey, currentPage string) {
 							invite tree
 						}
 						@NavLink(global.Settings.BrowseURI, false) {
-							<span x-init="$el.parentNode.setAttribute('href', $el.parentNode.href.replace('__URL__', encodeURIComponent(location.href.replace('http', 'ws').split('/').slice(0, 3).join('/')))); $el.parentNode.setAttribute('target', '_blank')">
+							<span x-init="$el.parentNode.setAttribute('href', $el.parentNode.href.replace('{url}', encodeURIComponent(location.href.replace('http', 'ws').split('/').slice(0, 3).join('/')))); $el.parentNode.setAttribute('target', '_blank')">
 								browse
 							</span>
 						}
-						if global.Settings.Groups.Enabled || pyramid.IsRoot(loggedUser) {
-							@NavLink("/groups/", currentPage == "groups") {
-								groups
-							}
-						}
-						if global.Settings.Grasp.Enabled || pyramid.IsRoot(loggedUser) {
-							@NavLink("/grasp/", currentPage == "grasp") {
-								grasp
-							}
-						}
+						<div
+							x-data="{ open: false }"
+							@click.away="open = false"
+							class="relative"
+						>
+							<button
+								@click="open = !open"
+								class={ "cursor-pointer rounded-lg px-4 py-2 font-medium flex items-center gap-1 themed:text-[var(--text-color)] themed:hover:bg-[rgb(from_var(--text-color)_r_g_b_/10%)] light:hover:bg-stone-100 dark:hover:bg-stone-700",
+                                    templ.KV("themed:bg-[rgb(from_var(--text-color)_r_g_b_/15%)] light:bg-stone-200 dark:bg-stone-700", currentPage == "groups" || currentPage == "grasp" || currentPage == "blossom"),
+                                    templ.KV("hidden", !(global.Settings.Groups.Enabled || global.Settings.Grasp.Enabled || global.Settings.Blossom.Enabled || pyramid.IsRoot(loggedUser))) }
+							>
+								switch currentPage {
+									case "groups":
+										groups
+									case "grasp":
+										grasp
+									case "blossom":
+										blossom
+									default:
+										services
+								}
+								<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+								</svg>
+							</button>
+							<div
+								x-show="open"
+								x-transition
+								class="absolute left-0 mt-2 w-48 bg-white dark:bg-stone-800 rounded-lg shadow-lg border border-stone-200 dark:border-stone-700 py-1 z-50"
+							>
+								if global.Settings.Groups.Enabled || pyramid.IsRoot(loggedUser) {
+									@NavLink("/groups/", currentPage == "groups") {
+										groups
+									}
+								}
+								if global.Settings.Grasp.Enabled || pyramid.IsRoot(loggedUser) {
+									@NavLink("/grasp/", currentPage == "grasp") {
+										grasp
+									}
+								}
+								if global.Settings.Blossom.Enabled || pyramid.IsRoot(loggedUser) {
+									@NavLink("/blossom/", currentPage == "blossom") {
+										blossom
+									}
+								}
+							</div>
+						</div>
 						<div
 							x-data="{ open: false }"
 							@click.away="open = false"
@@ -179,6 +217,11 @@ case "uppermost":
 								}
 							</div>
 						</div>
+						if pyramid.IsMember(loggedUser) {
+							@NavLink("/stats", currentPage == "stats") {
+								stats
+							}
+						}
 						if pyramid.IsRoot(loggedUser) {
 							@NavLink("/settings", currentPage == "settings") {
 								settings
@@ -189,20 +232,20 @@ case "uppermost":
 								<div x-data="authButton()">
 									<button
 										@click="handleAuth($event)"
-										class="px-4 py-2 rounded-lg font-semibold text-white shadow-md hover:shadow-lg themed:bg-[var(--accent-color)] light:bg-blue-500 hover:bg-blue-600"
+										class="cursor-pointer px-4 py-2 rounded-lg font-semibold text-white shadow-md hover:shadow-lg themed:bg-[var(--accent-color)] light:bg-blue-500 hover:bg-blue-600"
 									>
 										logout
 									</button>
 								</div>
 								if pyramid.IsMember(loggedUser) {
-									<a href="/member" class="light:text-stone-700 dark:text-stone-300 font-medium hover:underline">
+									<a href="/u" class="light:text-stone-700 dark:text-stone-300 font-medium hover:underline">
 										<nostr-name title={ loggedUser.Hex() } pubkey={ loggedUser.Hex() }>
-											{ loggedUser.Hex() }
+											{ loggedUser.Hex()[0:6] }
 										</nostr-name>
 									</a>
 								} else {
 									<nostr-name title={ loggedUser.Hex() } pubkey={ loggedUser.Hex() }>
-										{ loggedUser.Hex() }
+										{ loggedUser.Hex()[0:6] }
 									</nostr-name>
 								}
 							</div>
@@ -210,7 +253,7 @@ case "uppermost":
 							<div x-data="authButton()">
 								<button
 									@click="handleAuth($event)"
-									class="px-4 py-2 rounded-lg font-semibold text-white shadow-md hover:shadow-lg themed:bg-[var(--accent-color)] light:bg-blue-500 hover:bg-blue-600"
+									class="cursor-pointer px-4 py-2 rounded-lg font-semibold text-white shadow-md hover:shadow-lg themed:bg-[var(--accent-color)] light:bg-blue-500 hover:bg-blue-600"
 								>
 									login
 								</button>

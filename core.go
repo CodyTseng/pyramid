@@ -23,12 +23,13 @@ import (
 
 func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, msg string) {
 	if global.Settings.RequireCurrentTimestamp {
-		if event.CreatedAt > nostr.Now()+60 {
+		if event.CreatedAt > nostr.Now()+60 && !global.Settings.AcceptScheduledEvents {
+			// when accept_future_events is on we can accept this because the event will be stored separately anyway
 			return true, "event too much in the future"
 		}
 
 		switch event.Kind {
-		case 1, 9, 11, 1111, 1222, 1244, 20, 21, 22:
+		case 1, 9, 11, 1111, 1222, 1244, 20, 21, 22, 24:
 			if event.CreatedAt < nostr.Now()-60*5 {
 				return true, "event too much in the past"
 			}
@@ -145,6 +146,7 @@ var supportedKinds = []nostr.Kind{
 	20,
 	21,
 	22,
+	24,
 	818,
 	1040,
 	1063,
@@ -297,34 +299,38 @@ func onConnect(ctx context.Context) {
 }
 
 func preventBroadcast(ws *khatru.WebSocket, filter nostr.Filter, event nostr.Event) bool {
-	// nip29 metadata event
-	if slices.Contains(nip29.MetadataEventKinds, event.Kind) {
-		if filter.Kinds == nil {
-			// when a subscription doesn't specify kinds, assume they don't want nip29 metadata
-			return true
-		} else {
-			// (because we're checking event by event here, if there are kinds in the filter we assume this matches)
-			if group, ok := groups.State.Groups.Load(event.Tags.GetD()); ok {
-				return group.Private || !group.AnyOfTheseIsAMember(ws.AuthedPublicKeys)
-			} else {
-				log.Warn().Stringer("event", event).Msg("unexpected group not found")
-			}
-		}
-	}
-
-	// nip29 message
-	if h := event.Tags.Find("h"); h != nil {
-		if filter.Tags["h"] == nil {
-			// when a subscription doesn't specify the "h" tag, don't send them messages from nip29 groups
-			return true
-		} else {
-			// (because we're checking event by event here, if there are kinds in the filter we assume this matches)
-			// now even if they specify these we have to check if they can read
-			if group := groups.State.GetGroupFromEvent(event); group == nil {
-				log.Warn().Stringer("event", event).Msg("unexpected group not found")
+	if global.Settings.Groups.Enabled {
+		// nip29 metadata event
+		if slices.Contains(nip29.MetadataEventKinds, event.Kind) {
+			if filter.Kinds == nil {
+				// when a subscription doesn't specify kinds, assume they don't want nip29 metadata
 				return true
 			} else {
-				return group.Private || !group.AnyOfTheseIsAMember(ws.AuthedPublicKeys)
+				// (because we're checking event by event here, if there are kinds in the filter we assume this matches)
+				if group, ok := groups.State.Groups.Load(event.Tags.GetD()); ok {
+					return group.Private || !group.AnyOfTheseIsAMember(ws.AuthedPublicKeys)
+				} else {
+					log.Warn().Stringer("event", event).Msg("unexpected group not found")
+				}
+			}
+		}
+
+		// nip29 message
+		if h := event.Tags.Find("h"); h != nil {
+			if filter.Tags["h"] == nil {
+				// when a subscription doesn't specify the "h" tag, don't send them messages from nip29 groups
+				return true
+			} else {
+				// (because we're checking event by event here, if there are kinds in the filter we assume this matches)
+				// now even if they specify these we have to check if they can read
+				if group := groups.State.GetGroupFromEvent(event); group == nil {
+					log.Warn().Stringer("event", event).Msg("unexpected group not found")
+					return true
+				} else if group.Private {
+					return !group.AnyOfTheseIsAMember(ws.AuthedPublicKeys)
+				} else {
+					return false
+				}
 			}
 		}
 	}
@@ -344,12 +350,19 @@ func preventBroadcast(ws *khatru.WebSocket, filter nostr.Filter, event nostr.Eve
 			return true
 		} else {
 			// not paywalled, anyone can read
-			return false
 		}
 	} else {
 		// no paywalls, anyone can read
-		return false
 	}
+
+	// if we accept scheduled events we shouldn't broadcast them immediately, they will be broadcast later automatically
+	if global.Settings.AcceptScheduledEvents {
+		if event.CreatedAt > nostr.Now()+60 {
+			return true
+		}
+	}
+
+	return false
 }
 
 func processJoinRequest(ctx context.Context, event nostr.Event) {
@@ -448,11 +461,18 @@ func virtualInviteValidationEvent(inviter nostr.PubKey) nostr.Event {
 
 // splits the query between the main relay and the groups relay
 func queryStored(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
+	// if groups is disabled just query main directly
+	if !global.Settings.Groups.Enabled {
+		return queryMain(ctx, filter)
+	}
+
+	// otherwise we have to perform some convoluted routing between groups and normal
 	if filter.IDs != nil {
 		// query both normal and groups
 		return eventstore.SortedMerge(
 			queryNormal(ctx, filter),
 			groups.State.Query(ctx, filter),
+			filter.GetTheoreticalLimit(),
 		)
 	}
 
@@ -482,6 +502,7 @@ func queryStored(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event]
 		return eventstore.SortedMerge(
 			queryNormal(ctx, normalFilter),
 			groups.State.Query(ctx, groupsFilter),
+			filter.GetTheoreticalLimit(),
 		)
 	} else if groupsFilter.Kinds != nil && normalFilter.Kinds == nil {
 		// only groups kinds requested
@@ -508,6 +529,7 @@ func queryNormal(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event]
 		return eventstore.SortedMerge(
 			groups.State.Query(ctx, filter),
 			queryMain(ctx, filter),
+			filter.GetTheoreticalLimit(),
 		)
 	}
 
