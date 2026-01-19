@@ -13,11 +13,12 @@ import (
 
 type UserSettings struct {
 	// relay metadata
-	Domain           string `json:"domain"`
-	RelayName        string `json:"relay_name"`
-	RelayDescription string `json:"relay_description"`
-	RelayContact     string `json:"relay_contact"`
-	RelayIcon        string `json:"relay_icon"`
+	Domain           string   `json:"domain"`
+	RelayName        string   `json:"relay_name"`
+	RelayDescription string   `json:"relay_description"`
+	RelayContact     string   `json:"relay_contact"`
+	RelayIcon        string   `json:"relay_icon"`
+	Pinned           nostr.ID `json:"pinned,omitempty"`
 
 	// theme
 	Theme struct {
@@ -39,7 +40,7 @@ type UserSettings struct {
 	MaxEventSize            int    `json:"max_event_size"`
 	RequireCurrentTimestamp bool   `json:"require_current_timestamp"`
 	EnableOTS               bool   `json:"enable_ots"`
-	AcceptScheduledEvents   bool   `json:"accept_future_events"`
+	AcceptScheduledEvents   bool   `json:"accept_scheduled_events"`
 
 	Paywall struct {
 		Tag        string `json:"tag"`
@@ -54,7 +55,8 @@ type UserSettings struct {
 
 	RelayInternalSecretKey nostr.SecretKey `json:"relay_internal_secret_key"`
 
-	BlockedIPs []string `json:"blocked_ips"`
+	BlockedIPs   []string     `json:"blocked_ips"`
+	AllowedKinds []nostr.Kind `json:"allowed_kinds,omitempty"`
 
 	// per-relay
 	Internal struct {
@@ -98,16 +100,22 @@ type UserSettings struct {
 		RelayMetadata
 		MinPoW uint `json:"min_pow"`
 	} `json:"moderated"`
+
+	FTP struct {
+		Enabled  bool   `json:"enabled"`
+		Password string `json:"password"`
+	} `json:"ftp"`
 }
 
 type RelayMetadata struct {
 	base string // identifies where this is
 
-	Enabled      bool   `json:"enabled"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	Icon         string `json:"icon"`
-	HTTPBasePath string `json:"path"`
+	Enabled      bool     `json:"enabled"`
+	Name         string   `json:"name"`
+	Description  string   `json:"description"`
+	Icon         string   `json:"icon"`
+	HTTPBasePath string   `json:"path"`
+	Pinned       nostr.ID `json:"pinned,omitempty"`
 }
 
 func (rm RelayMetadata) GetName() string {
@@ -188,7 +196,7 @@ func getUserSettingsPath() string {
 func loadUserSettings() error {
 	// start it with the defaults
 	Settings = UserSettings{
-		BrowseURI:               "https://fevela.me/?r={url}",
+		BrowseURI:               "https://jumble.social/?r={url}",
 		LinkURL:                 "nostr:{code}",
 		MaxInvitesPerPerson:     4,
 		MaxEventSize:            10000,
@@ -209,6 +217,10 @@ func loadUserSettings() error {
 	Settings.Popular.HTTPBasePath = "popular"
 	Settings.Uppermost.HTTPBasePath = "uppermost"
 	Settings.Moderated.HTTPBasePath = "moderated"
+
+	// FTP settings
+	Settings.FTP.Enabled = false
+	Settings.FTP.Password = ""
 
 	// theme defaults
 	Settings.Theme.TextColor = "#ffffff"

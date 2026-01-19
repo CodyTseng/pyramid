@@ -48,6 +48,13 @@ func actionHandler(w http.ResponseWriter, r *http.Request) {
 		type_ = pyramid.ActionDrop
 	case pyramid.ActionLeave:
 		type_ = pyramid.ActionLeave
+	case pyramid.ActionDisable:
+		type_ = pyramid.ActionDisable
+	case pyramid.ActionEnable:
+		type_ = pyramid.ActionEnable
+	default:
+		http.Error(w, "unknown action", 400)
+		return
 	}
 	author, _ := global.GetLoggedUser(r)
 	target := global.PubKeyFromInput(r.PostFormValue("target"))
@@ -105,6 +112,8 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				// general settings
 			case "max_invites_per_person":
 				global.Settings.MaxInvitesPerPerson, _ = strconv.Atoi(v[0])
+			case "max_event_size":
+				global.Settings.MaxEventSize, _ = strconv.Atoi(v[0])
 			case "browse_uri":
 				global.Settings.BrowseURI = v[0]
 			case "link_url":
@@ -113,7 +122,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.RequireCurrentTimestamp = v[0] == "on"
 			case "enable_ots":
 				global.Settings.EnableOTS = v[0] == "on"
-			case "accept_future_events":
+			case "accept_scheduled_events":
 				global.Settings.AcceptScheduledEvents = v[0] == "on"
 			case "paywall_tag":
 				global.Settings.Paywall.Tag = v[0]
@@ -137,12 +146,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.RelayDescription = v[0]
 			case "main_icon":
 				global.Settings.RelayIcon = v[0]
+			case "main_pinned":
+				global.Settings.Pinned = checkPinnedID(v[0], global.IL.Main)
+				global.CachePinnedEvent("main")
 			case "favorites_name":
 				global.Settings.Favorites.Name = v[0]
 			case "favorites_description":
 				global.Settings.Favorites.Description = v[0]
 			case "favorites_icon":
 				global.Settings.Favorites.Icon = v[0]
+			case "favorites_pinned":
+				global.Settings.Favorites.Pinned = checkPinnedID(v[0], global.IL.Favorites)
+				global.CachePinnedEvent("favorites")
 			case "favorites_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -151,6 +166,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Favorites.HTTPBasePath = v[0]
 				favorites.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
 				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				favorites.Init()
 				go restartSoon()
 			case "moderated_name":
 				global.Settings.Moderated.Name = v[0]
@@ -158,11 +174,15 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Moderated.Description = v[0]
 			case "moderated_icon":
 				global.Settings.Moderated.Icon = v[0]
+			case "moderated_pinned":
+				global.Settings.Moderated.Pinned = checkPinnedID(v[0], global.IL.Moderated)
+				global.CachePinnedEvent("moderated")
 			case "moderated_httpBasePath":
 				if len(v[0]) > 0 {
 					global.Settings.Moderated.HTTPBasePath = v[0]
 					moderated.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
 					delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+					moderated.Init()
 					go restartSoon()
 				}
 			case "inbox_name":
@@ -171,6 +191,9 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Inbox.Description = v[0]
 			case "inbox_icon":
 				global.Settings.Inbox.Icon = v[0]
+			case "inbox_pinned":
+				global.Settings.Inbox.Pinned = checkPinnedID(v[0], global.IL.Inbox)
+				global.CachePinnedEvent("inbox")
 			case "inbox_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -179,6 +202,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Inbox.HTTPBasePath = v[0]
 				inbox.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
 				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				inbox.Init()
 				go restartSoon()
 			case "internal_name":
 				global.Settings.Internal.Name = v[0]
@@ -186,6 +210,9 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Internal.Description = v[0]
 			case "internal_icon":
 				global.Settings.Internal.Icon = v[0]
+			case "internal_pinned":
+				global.Settings.Internal.Pinned = checkPinnedID(v[0], global.IL.Internal)
+				global.CachePinnedEvent("internal")
 			case "internal_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -194,6 +221,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Internal.HTTPBasePath = v[0]
 				internal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
 				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				internal.Init()
 				go restartSoon()
 			case "popular_name":
 				global.Settings.Popular.Name = v[0]
@@ -201,6 +229,9 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Popular.Description = v[0]
 			case "popular_icon":
 				global.Settings.Popular.Icon = v[0]
+			case "popular_pinned":
+				global.Settings.Popular.Pinned = checkPinnedID(v[0], global.IL.Popular)
+				global.CachePinnedEvent("popular")
 			case "popular_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -209,6 +240,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Popular.HTTPBasePath = v[0]
 				popular.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
 				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				popular.Init()
 				go restartSoon()
 			case "uppermost_name":
 				global.Settings.Uppermost.Name = v[0]
@@ -216,6 +248,9 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Uppermost.Description = v[0]
 			case "uppermost_icon":
 				global.Settings.Uppermost.Icon = v[0]
+			case "uppermost_pinned":
+				global.Settings.Uppermost.Pinned = checkPinnedID(v[0], global.IL.Uppermost)
+				global.CachePinnedEvent("uppermost")
 			case "uppermost_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -224,6 +259,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Uppermost.HTTPBasePath = v[0]
 				uppermost.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
 				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				uppermost.Init()
 				go restartSoon()
 				//
 				// moderated-specific
@@ -263,7 +299,44 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				if val, err := strconv.Atoi(v[0]); err == nil {
 					global.Settings.Uppermost.PercentThreshold = val
 				}
+				//
+				// allowed kinds settings
+			case "allowed_kinds":
+				kinds := make([]nostr.Kind, 0, len(v[0])*6)
+				// split by comma and parse each kind
+				for _, s := range strings.Split(v[0], ",") {
+					if kind, err := strconv.ParseUint(strings.TrimSpace(s), 10, 16); err == nil {
+						kinds = append(kinds, nostr.Kind(kind))
+					}
+				}
+				// if no kinds are entered, set to nil to use the default list
+
+				if len(kinds) == 0 {
+					global.Settings.AllowedKinds = nil
+				} else {
+					global.Settings.AllowedKinds = kinds
+					slices.Sort(global.Settings.AllowedKinds)
+				}
+				//
+				// ftp settings
+			case "ftp_enabled":
+				global.Settings.FTP.Enabled = v[0] == "on"
+			case "ftp_password":
+				global.Settings.FTP.Password = v[0]
 			}
+		}
+
+		// start or stop SFTP server if necessary
+		if global.Settings.FTP.Enabled && global.Settings.FTP.Password != "" {
+			if sftpListener == nil {
+				go func() {
+					if err := startSFTP(); err != nil {
+						log.Error().Err(err).Msg("failed to start FTP server")
+					}
+				}()
+			}
+		} else {
+			stopSFTP()
 		}
 
 		if err := global.SaveUserSettings(); err != nil {

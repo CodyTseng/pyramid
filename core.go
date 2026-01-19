@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"iter"
 	"slices"
 	"unsafe"
@@ -24,7 +25,7 @@ import (
 func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, msg string) {
 	if global.Settings.RequireCurrentTimestamp {
 		if event.CreatedAt > nostr.Now()+60 && !global.Settings.AcceptScheduledEvents {
-			// when accept_future_events is on we can accept this because the event will be stored separately anyway
+			// when accept_scheduled_events is on we can accept this because the event will be stored separately anyway
 			return true, "event too much in the future"
 		}
 
@@ -33,6 +34,20 @@ func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, m
 			if event.CreatedAt < nostr.Now()-60*5 {
 				return true, "event too much in the past"
 			}
+		}
+	}
+
+	// check allowed kinds:
+	// allow all ephemeral
+	if !event.Kind.IsEphemeral() {
+		var kinds []nostr.Kind
+		if len(global.Settings.AllowedKinds) > 0 {
+			kinds = global.Settings.AllowedKinds
+		} else {
+			kinds = supportedKindsDefault
+		}
+		if _, allowed := slices.BinarySearch(kinds, nostr.Kind(event.Kind)); !allowed {
+			return true, fmt.Sprintf("event kind %d not allowed", event.Kind)
 		}
 	}
 
@@ -132,7 +147,8 @@ func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, m
 	return true, "not authorized"
 }
 
-var supportedKinds = []nostr.Kind{
+// this must be sorted, which we do on main()
+var supportedKindsDefault = []nostr.Kind{
 	0,
 	1,
 	3,
@@ -222,6 +238,21 @@ func rejectInviteRequestsNonAuthed(ctx context.Context, filter nostr.Filter) (bo
 // "-" plus the specific paywall "t" tag) to check if the querier is eligible for reading.
 func queryMain(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
 	return func(yield func(nostr.Event) bool) {
+		// try to get a pinned note first
+		if global.PinnedCache.Main != nil &&
+			filter.IDs == nil && filter.Tags == nil && filter.Authors == nil &&
+			filter.Until == 0 && filter.Since < global.PinnedCache.Main.CreatedAt &&
+			(filter.Kinds == nil || slices.Contains(filter.Kinds, global.PinnedCache.Main.Kind)) {
+			// display pinned in this case
+			if !yield(*global.PinnedCache.Main) {
+				return
+			}
+			if filter.Limit > 0 {
+				// we've used one limit
+				filter.Limit--
+			}
+		}
+
 		// handle special invite requests
 		if idx := slices.Index(filter.Kinds, 28935); idx != -1 {
 			if authed, ok := khatru.GetAuthed(ctx); ok && pyramid.CanInviteMore(authed) {
@@ -440,8 +471,8 @@ func publishMembershipChange(pubkey nostr.PubKey, added bool) {
 		}
 		relayMembersList.Sign(global.Settings.RelayInternalSecretKey)
 		roomCreationPermissionList.Sign(global.Settings.RelayInternalSecretKey)
-		c.store.SaveEvent(relayMembersList)
-		c.store.SaveEvent(roomCreationPermissionList)
+		c.store.ReplaceEvent(relayMembersList)
+		c.store.ReplaceEvent(roomCreationPermissionList)
 		c.relay.BroadcastEvent(relayMembersList)
 		c.relay.BroadcastEvent(roomCreationPermissionList)
 	}

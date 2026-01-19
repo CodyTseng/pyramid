@@ -51,6 +51,11 @@ func main() {
 	}
 	defer global.End()
 
+	// stuff we have to initialize
+	fillInRelevantUsersMapping()
+	slices.Sort(supportedKindsDefault)
+	slices.Sort(global.Settings.AllowedKinds)
+
 	// start periodic version checking
 	go func() {
 		for {
@@ -65,7 +70,7 @@ func main() {
 		if err := initOTS(); err == nil {
 			for {
 				checkOTS(context.Background())
-				time.Sleep(time.Hour * 2)
+				time.Sleep(time.Hour * 4)
 			}
 		}
 	}()
@@ -242,7 +247,6 @@ func main() {
 			return policies.SeqEvent(
 				policies.PreventTooManyIndexableTags(9, []nostr.Kind{3}, nil),
 				policies.PreventTooManyIndexableTags(1200, nil, []nostr.Kind{3}),
-				policies.RestrictToSpecifiedKinds(true, supportedKinds...),
 				policies.RejectUnprefixedNostrReferences,
 				basicRejectionLogic,
 			)(ctx, event)
@@ -296,9 +300,13 @@ func main() {
 	relay.ManagementAPI.BanEvent = banEventHandler
 	relay.ManagementAPI.BanPubKey = banPubKeyHandler
 	relay.ManagementAPI.ListAllowedPubKeys = listAllowedPubKeysHandler
+	relay.ManagementAPI.ListBannedPubKeys = listBannedPubKeysHandler
 	relay.ManagementAPI.ChangeRelayName = changeRelayNameHandler
 	relay.ManagementAPI.ChangeRelayDescription = changeRelayDescriptionHandler
 	relay.ManagementAPI.ChangeRelayIcon = changeRelayIconHandler
+	relay.ManagementAPI.ListAllowedKinds = listAllowedKindsHandler
+	relay.ManagementAPI.AllowKind = allowKindHandler
+	relay.ManagementAPI.DisallowKind = disallowKindHandler
 	relay.ManagementAPI.ListBlockedIPs = listBlockedIPsHandler
 	relay.ManagementAPI.BlockIP = blockIPHandler
 	relay.ManagementAPI.UnblockIP = unblockIPHandler
@@ -323,6 +331,15 @@ func main() {
 		}
 		info.Software = "https://github.com/fiatjaf/pyramid"
 		return info
+	}
+
+	// start SFTP server if enabled
+	if global.Settings.FTP.Enabled && global.Settings.FTP.Password != "" {
+		if err := startSFTP(); err != nil {
+			log.Error().Err(err).Msg("failed to start SFTP server")
+		}
+	} else if global.Settings.FTP.Enabled && global.Settings.FTP.Password == "" {
+		log.Warn().Msg("FTP server is enabled but no password is set - not starting server")
 	}
 
 	start()
