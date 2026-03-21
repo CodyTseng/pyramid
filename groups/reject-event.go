@@ -3,7 +3,6 @@ package groups
 import (
 	"context"
 	"fmt"
-	"iter"
 	"slices"
 
 	"fiatjaf.com/nostr"
@@ -24,6 +23,12 @@ func (s *GroupsState) RejectEvent(ctx context.Context, event nostr.Event) (rejec
 	// moderation action events must be new and not reused
 	if nip29.ModerationEventKinds.Includes(event.Kind) && event.CreatedAt < nostr.Now()-60 /* seconds */ {
 		return true, "moderation action is too old (older than 1 minute ago)"
+	}
+
+	// metadata events are emitted by the relay itself after applying moderation actions.
+	// external clients must not publish them directly.
+	if nip29.MetadataEventKinds.Includes(event.Kind) {
+		return true, "restricted: group metadata events are generated internally"
 	}
 
 	htag := event.Tags.Find("h")
@@ -86,14 +91,18 @@ func (s *GroupsState) RejectEvent(ctx context.Context, event nostr.Event) (rejec
 		}
 
 		// and they can't join if they have been kicked
-		next, done := iter.Pull(s.DB.QueryEvents(nostr.Filter{
+		var rem nostr.Event
+		var isRemoved bool
+		for removed := range s.DB.QueryEvents(nostr.Filter{
 			Kinds: []nostr.Kind{nostr.KindSimpleGroupRemoveUser},
 			Tags: nostr.TagMap{
 				"p": []string{event.PubKey.Hex()},
 			},
-		}, 1))
-		rem, isRemoved := next()
-		done()
+		}, 1) {
+			rem = removed
+			isRemoved = true
+			break
+		}
 
 		// if the user was removed previously we'll skip this
 		if isRemoved && !rem.Tags.Has("self-removal") {
@@ -110,7 +119,6 @@ func (s *GroupsState) RejectEvent(ctx context.Context, event nostr.Event) (rejec
 		group.mu.RLock()
 		if _, isMember := group.Members[event.PubKey]; !isMember {
 			group.mu.RUnlock()
-			fmt.Println("??", group.Restricted, group.Closed, pyramid.IsMember(event.PubKey))
 			return true, "blocked: unknown member"
 		}
 		group.mu.RUnlock()
@@ -169,6 +177,7 @@ func (s *GroupsState) RejectEvent(ctx context.Context, event nostr.Event) (rejec
 				}
 			}
 			if ineffective {
+				group.mu.RUnlock()
 				return true, "all targets are members already"
 			}
 			group.mu.RUnlock()
@@ -182,6 +191,7 @@ func (s *GroupsState) RejectEvent(ctx context.Context, event nostr.Event) (rejec
 				}
 			}
 			if ineffective {
+				group.mu.RUnlock()
 				return true, "all targets have left already"
 			}
 			group.mu.RUnlock()
@@ -221,6 +231,18 @@ func (s *GroupsState) RejectEvent(ctx context.Context, event nostr.Event) (rejec
 			if !isPrimaryRole {
 				return true, "can't delete group"
 			}
+		}
+	}
+
+	// check if group supports only specific kinds (if nil we support everything)
+	if group.SupportedKinds != nil {
+		if len(group.SupportedKinds) == 0 && group.LiveKit {
+			// special case, return a nicer message
+			return true, "blocked: this is a live audio/video group only"
+		}
+
+		if !slices.Contains(group.SupportedKinds, event.Kind) {
+			return true, "blocked: kind not supported by this group"
 		}
 	}
 

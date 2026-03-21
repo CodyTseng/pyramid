@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,14 +18,19 @@ import (
 	"fiatjaf.com/nostr/nip05"
 	"fiatjaf.com/nostr/nip19"
 
+	"github.com/fiatjaf/pyramid/blossom"
 	"github.com/fiatjaf/pyramid/favorites"
 	"github.com/fiatjaf/pyramid/global"
+	"github.com/fiatjaf/pyramid/groups"
 	"github.com/fiatjaf/pyramid/inbox"
 	"github.com/fiatjaf/pyramid/internal"
 	"github.com/fiatjaf/pyramid/moderated"
+	"github.com/fiatjaf/pyramid/personal"
 	"github.com/fiatjaf/pyramid/popular"
 	"github.com/fiatjaf/pyramid/pyramid"
+	"github.com/fiatjaf/pyramid/search"
 	"github.com/fiatjaf/pyramid/uppermost"
+	"github.com/pemistahl/lingua-go"
 )
 
 func inviteTreeHandler(w http.ResponseWriter, r *http.Request) {
@@ -36,6 +42,7 @@ func inviteTreeHandler(w http.ResponseWriter, r *http.Request) {
 			nip05Names[pubkey] = name
 		}
 	}
+
 	inviteTreePage(loggedUser, nip05Names).Render(r.Context(), w)
 }
 
@@ -111,7 +118,22 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				//
 				// general settings
 			case "max_invites_per_person":
-				global.Settings.MaxInvitesPerPerson, _ = strconv.Atoi(v[0])
+				if strings.Contains(v[0], "/") {
+					parts := strings.Split(v[0], "/")
+					levels := make([]int, 0, len(parts))
+					for _, p := range parts {
+						if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+							levels = append(levels, n)
+						}
+					}
+					if len(levels) > 0 {
+						global.Settings.MaxInvitesAtEachLevel = levels
+						global.Settings.MaxInvitesPerPerson = 0
+					}
+				} else {
+					global.Settings.MaxInvitesPerPerson, _ = strconv.Atoi(v[0])
+					global.Settings.MaxInvitesAtEachLevel = nil
+				}
 			case "max_event_size":
 				global.Settings.MaxEventSize, _ = strconv.Atoi(v[0])
 			case "browse_uri":
@@ -124,15 +146,76 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.EnableOTS = v[0] == "on"
 			case "accept_scheduled_events":
 				global.Settings.AcceptScheduledEvents = v[0] == "on"
-			case "paywall_tag":
-				global.Settings.Paywall.Tag = v[0]
-			case "paywall_amount":
-				if amt, err := strconv.ParseUint(v[0], 10, 64); err == nil {
-					global.Settings.Paywall.AmountSats = uint(amt)
+			case "custom_update_source":
+				customUpdateSource = v[0]
+				fetchLatestVersion()
+			case "livekit_server_url":
+				if groups.LiveKitEmbedded {
+					if err := groups.StopEmbeddedLiveKit(); err != nil {
+						http.Error(w, "failed to stop embedded livekit: "+err.Error(), 500)
+						return
+					}
 				}
-			case "paywall_period":
-				if days, err := strconv.ParseUint(v[0], 10, 64); err == nil {
-					global.Settings.Paywall.PeriodDays = uint(days)
+				u, err := url.Parse(v[0])
+				if err == nil && (u.Scheme == "http" || u.Scheme == "https" || u.Scheme == "ws" || u.Scheme == "wss") {
+					u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
+					global.Settings.Groups.LiveKitServerURL = u.String()
+				}
+			case "livekit_api_key":
+				global.Settings.Groups.LiveKitAPIKey = v[0]
+			case "livekit_api_secret":
+				global.Settings.Groups.LiveKitAPISecret = v[0]
+			case "enable_search":
+				wasEnabled := global.Settings.Search.Enable
+				global.Settings.Search.Enable = v[0] == "on"
+
+				// close search and disable
+				if wasEnabled && !global.Settings.Search.Enable {
+					search.Main.Close()
+				}
+
+				// initialize search index if search is being turned on (was off, now on)
+				if !wasEnabled && global.Settings.Search.Enable {
+					if err := search.Init(); err != nil {
+						log.Error().Err(err).Msg("failed to initialize search")
+						global.Settings.Search.Enable = false
+					}
+					if err := search.UpdateSearchOn(); err != nil {
+						log.Warn().Err(err).Msg("failed to update search on timestamp")
+					}
+				}
+			case "search_languages":
+				if len(v) > 0 {
+					for _, code := range v {
+						isoCode := lingua.GetIsoCode639_1FromValue(code)
+						if isoCode == lingua.UnknownIsoCode639_1 {
+							http.Error(w, "invalid search language", 400)
+							return
+						}
+					}
+
+					global.Settings.Search.Languages = v
+				} else {
+					global.Settings.Search.Languages = []string{"en"}
+				}
+				// call BuildLanguageDetector() to rebuild with new languages
+				search.BuildLanguageDetector()
+				// update timestamp when languages change
+				if err := search.UpdateLanguagesChange(); err != nil {
+					log.Warn().Err(err).Msg("failed to update languages change timestamp")
+				}
+			case "root_member_pubkey":
+				if v[0] == "" {
+					continue
+				}
+				target := global.PubKeyFromInput(v[0])
+				if target == nostr.ZeroPK {
+					http.Error(w, "invalid public key", 400)
+					return
+				}
+				if err := pyramid.AddAction(pyramid.ActionInvite, pyramid.AbsoluteKey, target); err != nil {
+					http.Error(w, "failed to add root user: "+err.Error(), 500)
+					return
 				}
 				//
 				// nip-05 settings
@@ -148,7 +231,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.RelayIcon = v[0]
 			case "main_pinned":
 				global.Settings.Pinned = checkPinnedID(v[0], global.IL.Main)
-				global.CachePinnedEvent("main")
+				global.CachePinnedEvent(global.RelayMain)
 			case "favorites_name":
 				global.Settings.Favorites.Name = v[0]
 			case "favorites_description":
@@ -157,7 +240,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Favorites.Icon = v[0]
 			case "favorites_pinned":
 				global.Settings.Favorites.Pinned = checkPinnedID(v[0], global.IL.Favorites)
-				global.CachePinnedEvent("favorites")
+				global.CachePinnedEvent(global.RelayFavorites)
 			case "favorites_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -176,7 +259,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Moderated.Icon = v[0]
 			case "moderated_pinned":
 				global.Settings.Moderated.Pinned = checkPinnedID(v[0], global.IL.Moderated)
-				global.CachePinnedEvent("moderated")
+				global.CachePinnedEvent(global.RelayModerated)
 			case "moderated_httpBasePath":
 				if len(v[0]) > 0 {
 					global.Settings.Moderated.HTTPBasePath = v[0]
@@ -193,7 +276,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Inbox.Icon = v[0]
 			case "inbox_pinned":
 				global.Settings.Inbox.Pinned = checkPinnedID(v[0], global.IL.Inbox)
-				global.CachePinnedEvent("inbox")
+				global.CachePinnedEvent(global.RelayInbox)
 			case "inbox_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -212,7 +295,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Internal.Icon = v[0]
 			case "internal_pinned":
 				global.Settings.Internal.Pinned = checkPinnedID(v[0], global.IL.Internal)
-				global.CachePinnedEvent("internal")
+				global.CachePinnedEvent(global.RelayInternal)
 			case "internal_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -223,6 +306,22 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
 				internal.Init()
 				go restartSoon()
+			case "personal_name":
+				global.Settings.Personal.Name = v[0]
+			case "personal_description":
+				global.Settings.Personal.Description = v[0]
+			case "personal_icon":
+				global.Settings.Personal.Icon = v[0]
+			case "personal_httpBasePath":
+				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
+					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
+					return
+				}
+				global.Settings.Personal.HTTPBasePath = v[0]
+				personal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
+				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				personal.Init()
+				go restartSoon()
 			case "popular_name":
 				global.Settings.Popular.Name = v[0]
 			case "popular_description":
@@ -231,7 +330,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Popular.Icon = v[0]
 			case "popular_pinned":
 				global.Settings.Popular.Pinned = checkPinnedID(v[0], global.IL.Popular)
-				global.CachePinnedEvent("popular")
+				global.CachePinnedEvent(global.RelayPopular)
 			case "popular_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -250,7 +349,7 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Uppermost.Icon = v[0]
 			case "uppermost_pinned":
 				global.Settings.Uppermost.Pinned = checkPinnedID(v[0], global.IL.Uppermost)
-				global.CachePinnedEvent("uppermost")
+				global.CachePinnedEvent(global.RelayUppermost)
 			case "uppermost_httpBasePath":
 				if len(v[0]) == 0 || !justLetters.MatchString(v[0]) {
 					http.Error(w, "invalid path must contain only ascii letters and numbers", 400)
@@ -323,6 +422,23 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.FTP.Enabled = v[0] == "on"
 			case "ftp_password":
 				global.Settings.FTP.Password = v[0]
+			case "blossom_max_user_upload_size":
+				if strings.Contains(v[0], "/") {
+					parts := strings.Split(v[0], "/")
+					levels := make([]int, 0, len(parts))
+					for _, p := range parts {
+						if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+							levels = append(levels, n)
+						}
+					}
+					if len(levels) > 0 {
+						global.Settings.Blossom.MaxUserUploadSizeAtEachLevel = levels
+						global.Settings.Blossom.MaxUserUploadSize = 0
+					}
+				} else {
+					global.Settings.Blossom.MaxUserUploadSize, _ = strconv.Atoi(v[0])
+					global.Settings.Blossom.MaxUserUploadSizeAtEachLevel = nil
+				}
 			}
 		}
 
@@ -459,6 +575,8 @@ func iconHandler(w http.ResponseWriter, r *http.Request) {
 			global.Settings.Inbox.Icon = global.Settings.HTTPScheme() + global.Settings.Domain + "/icon/" + base + ext
 		case "internal":
 			global.Settings.Internal.Icon = global.Settings.HTTPScheme() + global.Settings.Domain + "/icon/" + base + ext
+		case "personal":
+			global.Settings.Personal.Icon = global.Settings.HTTPScheme() + global.Settings.Domain + "/icon/" + base + ext
 		case "popular":
 			global.Settings.Popular.Icon = global.Settings.HTTPScheme() + global.Settings.Domain + "/icon/" + base + ext
 		case "uppermost":
@@ -537,9 +655,15 @@ func setupDomain(domain string) error {
 	inbox.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Inbox.HTTPBasePath
 	favorites.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Favorites.HTTPBasePath
 	internal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Internal.HTTPBasePath
+	personal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Personal.HTTPBasePath
 	moderated.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Moderated.HTTPBasePath
 	popular.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Popular.HTTPBasePath
 	uppermost.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Uppermost.HTTPBasePath
+
+	blossom.BlobIndex.ServiceURL = global.Settings.HTTPScheme() + global.Settings.Domain
+	if blossom.Server != nil {
+		blossom.Server.ServiceURL = blossom.BlobIndex.ServiceURL
+	}
 
 	go restartSoon()
 	return nil
@@ -581,6 +705,22 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost {
+		if customUpdateSource != "" {
+			version, err := resolveCustomUpdateSource(customUpdateSource)
+			if err != nil {
+				http.Error(w, "failed to resolve custom update source: "+err.Error(), 400)
+				return
+			}
+			latestVersion = version
+		} else {
+			version, err := fetchLatestFromGitHub("fiatjaf/pyramid")
+			if err != nil {
+				http.Error(w, "failed to fetch latest version: "+err.Error(), 500)
+				return
+			}
+			latestVersion = version
+		}
+
 		// if the update is successful the process will restart so this function will never return
 		if err := performUpdateInPlace(); err != nil {
 			log.Error().Err(err).Msg("update failed")
@@ -592,6 +732,22 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unexpected: update done, but couldn't restart the server (or something else)", 500)
 		return
 	}
+}
+
+func restartHandler(w http.ResponseWriter, r *http.Request) {
+	loggedUser, _ := global.GetLoggedUser(r)
+	if !pyramid.IsRoot(loggedUser) {
+		http.Error(w, "unauthorized", 403)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	go restartSoon()
+	fmt.Fprint(w, "restarting")
 }
 
 func forumHandler(w http.ResponseWriter, r *http.Request) {
@@ -689,7 +845,15 @@ func memberPageHandler(w http.ResponseWriter, r *http.Request) {
 		mainStats, _ = global.IL.Main.ComputeStats(mmm.StatsOptions{OnlyPubKey: user})
 	}
 
-	memberPage(loggedUser, user, nip05, mainStats).Render(r.Context(), w)
+	// compute blossom used storage
+	var blossomUsed int
+	if global.Settings.Blossom.Enabled {
+		for blob := range blossom.BlobIndex.List(r.Context(), user) {
+			blossomUsed += blob.Size
+		}
+	}
+
+	memberPage(loggedUser, user, nip05, mainStats, blossomUsed).Render(r.Context(), w)
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -706,12 +870,13 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	groupsStats, _ := global.IL.Groups.ComputeStats(mmm.StatsOptions{})
 	favoritesStats, _ := global.IL.Favorites.ComputeStats(mmm.StatsOptions{})
 	internalStats, _ := global.IL.Internal.ComputeStats(mmm.StatsOptions{})
+	personalStats, _ := global.IL.Personal.ComputeStats(mmm.StatsOptions{})
 	moderatedStats, _ := global.IL.Moderated.ComputeStats(mmm.StatsOptions{})
 	popularStats, _ := global.IL.Popular.ComputeStats(mmm.StatsOptions{})
 	uppermostStats, _ := global.IL.Uppermost.ComputeStats(mmm.StatsOptions{})
 	inboxStats, _ := global.IL.Inbox.ComputeStats(mmm.StatsOptions{})
 
-	StatsPage(loggedUser, mainStats, systemStats, groupsStats, favoritesStats, internalStats, moderatedStats, popularStats, uppermostStats, inboxStats).Render(r.Context(), w)
+	StatsPage(loggedUser, mainStats, systemStats, groupsStats, favoritesStats, internalStats, personalStats, moderatedStats, popularStats, uppermostStats, inboxStats).Render(r.Context(), w)
 }
 
 func syncHandler(w http.ResponseWriter, r *http.Request) {
@@ -725,7 +890,18 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	download := r.FormValue("download") == "on"
 	upload := r.FormValue("upload") == "on"
 
-	streamingSync(r.Context(), loggedUser, remoteUrl, download, upload, w)
+	// use the pubkey from the form (member page being synced) or fallback to logged user
+	targetUser := loggedUser
+	if pubkeyStr := r.FormValue("pubkey"); pubkeyStr != "" {
+		if target := global.PubKeyFromInput(pubkeyStr); target != nostr.ZeroPK {
+			// verify that the logged user can sync this user's events
+			if target == loggedUser || pyramid.IsRoot(loggedUser) {
+				targetUser = target
+			}
+		}
+	}
+
+	streamingSync(r.Context(), targetUser, remoteUrl, download, upload, w)
 }
 
 func nip05Handler(w http.ResponseWriter, r *http.Request) {

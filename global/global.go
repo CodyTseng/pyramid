@@ -22,6 +22,27 @@ var (
 	Settings UserSettings
 )
 
+type RelayID string
+
+// String returns the string representation of RelayID
+func (r RelayID) String() string {
+	return string(r)
+}
+
+const (
+	RelayMain      RelayID = "main"
+	RelayInternal  RelayID = "internal"
+	RelayPersonal  RelayID = "personal"
+	RelayFavorites RelayID = "favorites"
+	RelayGroups    RelayID = "groups"
+	RelayInbox     RelayID = "inbox"
+	RelaySecret    RelayID = "secret"
+	RelayModerated RelayID = "moderated"
+	RelayPopular   RelayID = "popular"
+	RelayUppermost RelayID = "uppermost"
+	RelayBlossom   RelayID = "blossom"
+)
+
 var Log = zerolog.New(os.Stderr).Output(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
 
 func Init() error {
@@ -60,6 +81,11 @@ func Init() error {
 	IL.Internal, err = MMMM.EnsureLayer("internal")
 	if err != nil {
 		return fmt.Errorf("failed to ensure 'internal': %w", err)
+	}
+
+	IL.Personal, err = MMMM.EnsureLayer("personal")
+	if err != nil {
+		return fmt.Errorf("failed to ensure 'personal': %w", err)
 	}
 
 	IL.Groups, err = MMMM.EnsureLayer("groups")
@@ -112,9 +138,6 @@ func Init() error {
 		return fmt.Errorf("failed to ensure 'blossom': %w", err)
 	}
 
-	// paywall cache
-	go paywallCacheCleanup()
-
 	return nil
 }
 
@@ -132,6 +155,7 @@ var IL struct {
 	// specific
 	Favorites *mmm.IndexingLayer
 	Internal  *mmm.IndexingLayer
+	Personal  *mmm.IndexingLayer
 	Groups    *mmm.IndexingLayer
 	Inbox     *mmm.IndexingLayer
 

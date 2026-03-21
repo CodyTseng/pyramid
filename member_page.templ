@@ -11,7 +11,7 @@ import (
 	"github.com/fiatjaf/pyramid/pyramid"
 )
 
-templ memberPage(loggedUser nostr.PubKey, user nostr.PubKey, nip05 string, mainStats mmm.EventStats) {
+templ memberPage(loggedUser nostr.PubKey, user nostr.PubKey, nip05 string, mainStats mmm.EventStats, blossomUsed int) {
 	@layout.Layout(loggedUser, "member page") {
 		<div class="max-w-4xl mx-auto">
 			<!-- Account Info Section -->
@@ -46,14 +46,18 @@ templ memberPage(loggedUser nostr.PubKey, user nostr.PubKey, nip05 string, mainS
 						<span class="text-sm font-medium light:text-stone-600 dark:text-stone-400">status:</span>
 						if pyramid.IsRoot(user) {
 							<span class="ml-2 text-sm font-semibold themed:text-[var(--extra-color)] light:text-emerald-600 dark:text-emerald-400">root member</span>
+							<span class="text-sm light:text-stone-500 dark:text-stone-400">(level 0)</span>
 						} else if pyramid.IsMember(user) {
 							<span class="ml-2 text-sm text-green-600 dark:text-green-400">member</span>
+							<span class="text-sm light:text-stone-500 dark:text-stone-400">(level { fmt.Sprintf("%d", pyramid.GetLevel(user)) })</span>
 							<div class="w-full">
 								<span class="text-sm font-medium light:text-stone-600 dark:text-stone-400">invited by:</span>
 								<div class="ml-2 space-y-1">
 									for _, inviter := range pyramid.GetInviters(user) {
 										<div class="text-sm">
-											<code class="light:bg-stone-100 dark:bg-stone-800 px-2 rounded">{ inviter.Hex() }</code>
+											<a href={ templ.SafeURL("/u/" + inviter.Hex()) } class="light:bg-stone-100 dark:bg-stone-800 px-2 rounded hover:underline">
+												<nostr-name pubkey={ inviter.Hex() }>{ inviter.Hex() }</nostr-name>
+											</a>
 										</div>
 									}
 								</div>
@@ -62,6 +66,44 @@ templ memberPage(loggedUser nostr.PubKey, user nostr.PubKey, nip05 string, mainS
 							<span class="ml-2 text-sm font-semibold themed:text-[var(--extra-color)] light:text-emerald-600 dark:text-emerald-400">not a member</span>
 						}
 					</div>
+					if pyramid.IsMember(user) {
+						if global.Settings.Blossom.Enabled {
+							<div class="flex items-center gap-x-2 flex-wrap">
+								<span class="text-sm font-medium light:text-stone-600 dark:text-stone-400">blossom storage:</span>
+								if pyramid.IsRoot(user) || pyramid.GetMaxBlossomUploadSizeFor(user) == 0 {
+									<span class="ml-2 text-sm">{ fmt.Sprintf("%.1f MB used", float64(blossomUsed)/(1024*1024)) } / unlimited</span>
+								} else {
+									<span class="ml-2 text-sm">{ fmt.Sprintf("%.1f / %d MB", float64(blossomUsed)/(1024*1024), pyramid.GetMaxBlossomUploadSizeFor(user)) }</span>
+								}
+							</div>
+						}
+						<div class="flex items-center gap-x-2 flex-wrap">
+							<span class="text-sm font-medium light:text-stone-600 dark:text-stone-400">invites left:</span>
+							if pyramid.IsRoot(user) {
+								<span class="ml-2 text-sm">unlimited</span>
+							} else {
+								{{ invitesLeft := pyramid.GetMaxInvitesFor(user) - pyramid.GetInviteCount(user) }}
+								<span class="ml-2 text-sm">{ fmt.Sprintf("%d", invitesLeft) }</span>
+							}
+						</div>
+						<div class="flex items-start gap-x-2 flex-wrap">
+							<span class="text-sm font-medium light:text-stone-600 dark:text-stone-400">invited members:</span>
+							<div class="ml-2 space-y-1">
+								{{ hasInvitees := false }}
+								for invitee, _ := range pyramid.GetChildren(user) {
+									{{ hasInvitees = true }}
+									<div class="text-sm">
+										<a href={ templ.SafeURL("/u/" + invitee.Hex()) } class="light:bg-stone-100 dark:bg-stone-800 px-2 rounded hover:underline">
+											<nostr-name pubkey={ invitee.Hex() }>{ invitee.Hex() }</nostr-name>
+										</a>
+									</div>
+								}
+								if !hasInvitees {
+									<span class="text-sm light:text-stone-500 dark:text-stone-400">none</span>
+								}
+							</div>
+						</div>
+					}
 				</div>
 			</div>
 			//
@@ -97,7 +139,7 @@ templ memberPage(loggedUser nostr.PubKey, user nostr.PubKey, nip05 string, mainS
 					action="/u"
 					class="space-y-6 mt-8"
 					x-data={ `{
-					nip05Username: ` + global.JSONString(nip05) + `',
+					nip05Username: ` + global.JSONString(nip05) + `,
 					saved: false,
 					async saveSettings() {
 						const response = await fetch(this.$refs.form.action, {
@@ -154,6 +196,7 @@ templ memberPage(loggedUser nostr.PubKey, user nostr.PubKey, nip05 string, mainS
 					action="/u/sync"
 					class="space-y-6 mt-8"
 				>
+					<input type="hidden" name="pubkey" value={ user.Hex() }/>
 					<div class="space-y-4">
 						<div>
 							@layout.SubSectionTitle("negentropy sync")

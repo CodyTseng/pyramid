@@ -1,6 +1,7 @@
 package groups
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 
@@ -16,7 +17,6 @@ const (
 )
 
 type GroupsState struct {
-	Domain string
 	Groups *xsync.MapOf[string, *Group]
 	DB     eventstore.Store
 
@@ -31,7 +31,6 @@ type GroupsState struct {
 }
 
 type Options struct {
-	Domain    string
 	DB        eventstore.Store
 	SecretKey nostr.SecretKey
 	Broadcast func(nostr.Event) int
@@ -44,7 +43,6 @@ func NewGroupsState(opts Options) *GroupsState {
 	groups := xsync.NewMapOf[string, *Group]()
 
 	state := &GroupsState{
-		Domain: opts.Domain,
 		Groups: groups,
 		DB:     opts.DB,
 
@@ -61,6 +59,18 @@ func NewGroupsState(opts Options) *GroupsState {
 	}
 
 	return state
+}
+
+func (s *GroupsState) HandleEventSaved(event nostr.Event) {
+	for _, affectedGroup := range s.ProcessEvent(context.Background(), event) {
+		for updated, err := range s.SyncGroupMetadataEvents(affectedGroup) {
+			if err != nil {
+				log.Error().Err(err).Stringer("event", event).Msg("failed to handle group event")
+			} else {
+				s.broadcast(updated)
+			}
+		}
+	}
 }
 
 func (s *GroupsState) WipeGroup(groupId string) error {

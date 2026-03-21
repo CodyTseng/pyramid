@@ -19,7 +19,9 @@ import (
 	"github.com/fiatjaf/pyramid/global"
 	"github.com/fiatjaf/pyramid/groups"
 	"github.com/fiatjaf/pyramid/internal"
+	"github.com/fiatjaf/pyramid/paywall"
 	"github.com/fiatjaf/pyramid/pyramid"
+	"github.com/fiatjaf/pyramid/search"
 )
 
 func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, msg string) {
@@ -37,15 +39,23 @@ func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, m
 		}
 	}
 
-	// check allowed kinds:
-	// allow all ephemeral
-	if !event.Kind.IsEphemeral() {
-		var kinds []nostr.Kind
-		if len(global.Settings.AllowedKinds) > 0 {
-			kinds = global.Settings.AllowedKinds
-		} else {
-			kinds = supportedKindsDefault
+	// if a member has referenced a list on his paywall settings we'll accept that
+	if global.Settings.Paywall.Enabled {
+		if event.Kind.IsReplaceable() || event.Kind.IsAddressable() {
+			if is := paywall.IsReferenced(event); is {
+				return false, ""
+			}
 		}
+	}
+
+	// check allowed kinds:
+	switch {
+	case event.Kind.IsEphemeral():
+		// allow all ephemeral
+	case event.Kind == 1163 && global.Settings.Paywall.Enabled:
+		// allow 1163 if paywall is enabled
+	default:
+		kinds := global.GetAllowedKinds()
 		if _, allowed := slices.BinarySearch(kinds, nostr.Kind(event.Kind)); !allowed {
 			return true, fmt.Sprintf("event kind %d not allowed", event.Kind)
 		}
@@ -53,6 +63,15 @@ func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, m
 
 	// handle special kinds
 	switch event.Kind {
+	case 1163:
+		// NIP-63 events - only accept from relay members when paywall is enabled
+		if !global.Settings.Paywall.Enabled {
+			return true, "kind 1163 not supported: paywall disabled"
+		}
+		if !pyramid.IsMember(event.PubKey) {
+			return true, "not authorized: only relay members can publish kind 1163 events"
+		}
+		return false, ""
 	case 9735:
 		// we accept outgoing zaps if they include a zap receipt from a member
 		ok := false
@@ -144,73 +163,15 @@ func basicRejectionLogic(ctx context.Context, event nostr.Event) (reject bool, m
 		return false, ""
 	}
 
-	return true, "not authorized"
-}
+	// validate nip63 logic
+	if event.Tags.Find("nip63") != nil {
+		// if event has nip63 tag, it must also have "-" tag
+		if !nip70.IsProtected(event) {
+			return true, "nip63 tag requires '-' tag"
+		}
+	}
 
-// this must be sorted, which we do on main()
-var supportedKindsDefault = []nostr.Kind{
-	0,
-	1,
-	3,
-	5,
-	6,
-	7,
-	8,
-	9,
-	11,
-	16,
-	20,
-	21,
-	22,
-	24,
-	818,
-	1040,
-	1063,
-	1111,
-	1984,
-	1985,
-	7375,
-	7376,
-	9321,
-	9735,
-	9802,
-	10000,
-	10001,
-	10002,
-	10003,
-	10004,
-	10005,
-	10006,
-	10007,
-	10009,
-	10015,
-	10019,
-	10030,
-	10050,
-	10101,
-	10102,
-	17375,
-	24133,
-	30000,
-	30002,
-	30003,
-	30004,
-	30008,
-	30009,
-	30015,
-	30818,
-	30819,
-	30023,
-	30030,
-	30078,
-	30311,
-	30617,
-	30618,
-	31922,
-	31923,
-	31924,
-	31925,
-	39701,
+	return true, "not authorized"
 }
 
 func rejectInviteRequestsNonAuthed(ctx context.Context, filter nostr.Filter) (bool, string) {
@@ -237,19 +198,24 @@ func rejectInviteRequestsNonAuthed(ctx context.Context, filter nostr.Filter) (bo
 // if paywall settings are configured it stops at each paywalled event (events with the
 // "-" plus the specific paywall "t" tag) to check if the querier is eligible for reading.
 func queryMain(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
+	if filter.Search != "" && global.Settings.Search.Enable {
+		return search.Main.QueryEvents(filter, 40)
+	}
+
 	return func(yield func(nostr.Event) bool) {
 		// try to get a pinned note first
 		if global.PinnedCache.Main != nil &&
 			filter.IDs == nil && filter.Tags == nil && filter.Authors == nil &&
-			filter.Until == 0 && filter.Since < global.PinnedCache.Main.CreatedAt &&
-			(filter.Kinds == nil || slices.Contains(filter.Kinds, global.PinnedCache.Main.Kind)) {
+			filter.Until == 0 && filter.Since < global.PinnedCache.Main.CreatedAt {
 			// display pinned in this case
-			if !yield(*global.PinnedCache.Main) {
-				return
-			}
-			if filter.Limit > 0 {
-				// we've used one limit
-				filter.Limit--
+			if y, ok := global.PreparedPinned(global.PinnedCache.Main, filter); ok {
+				if !yield(y) {
+					return
+				}
+				if filter.Limit > 0 {
+					// we've used one limit
+					filter.Limit--
+				}
 			}
 		}
 
@@ -289,19 +255,26 @@ func queryMain(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
 		}
 
 		// normal query
-		if global.Settings.Paywall.AmountSats > 0 && global.Settings.Paywall.PeriodDays > 0 {
+		if global.Settings.Paywall.Enabled {
 			// use this special query that filters content for paying visitors
 			authed := khatru.GetAllAuthed(ctx)
 
 			for evt := range global.IL.Main.QueryEvents(filter, 500) {
-				if nip70.IsProtected(evt) && (global.Settings.Paywall.Tag == "" || evt.Tags.FindWithValue("t", global.Settings.Paywall.Tag) != nil) {
+				if evt.Tags.Has("nip63") {
 					// this is a paywalled event, check if reader can read
 					for _, pk := range authed {
-						if global.CanReadPaywalled(evt.PubKey, pk) {
+						if paywall.CanRead(evt.PubKey, pk) {
 							if !yield(evt) {
 								return
 							}
 							break
+						}
+					}
+				} else if evt.Kind == 1163 {
+					// hide paywall reader lists except from their author
+					if khatru.IsAuthed(ctx, evt.PubKey) {
+						if !yield(evt) {
+							return
 						}
 					}
 				} else {
@@ -324,55 +297,26 @@ func queryMain(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
 
 func onConnect(ctx context.Context) {
 	// if there is a paywall give the reader the option to auth
-	if global.Settings.Paywall.AmountSats > 0 && global.Settings.Paywall.PeriodDays > 0 {
+	if global.Settings.Paywall.Enabled {
 		khatru.RequestAuth(ctx)
 	}
 }
 
 func preventBroadcast(ws *khatru.WebSocket, filter nostr.Filter, event nostr.Event) bool {
-	if global.Settings.Groups.Enabled {
+	if global.Settings.Groups.Enabled && (nip29.MetadataEventKinds.Includes(event.Kind) || event.Tags.Find("h") != nil) {
 		// nip29 metadata event
-		if slices.Contains(nip29.MetadataEventKinds, event.Kind) {
-			if filter.Kinds == nil {
-				// when a subscription doesn't specify kinds, assume they don't want nip29 metadata
-				return true
-			} else {
-				// (because we're checking event by event here, if there are kinds in the filter we assume this matches)
-				if group, ok := groups.State.Groups.Load(event.Tags.GetD()); ok {
-					return group.Private || !group.AnyOfTheseIsAMember(ws.AuthedPublicKeys)
-				} else {
-					log.Warn().Stringer("event", event).Msg("unexpected group not found")
-				}
-			}
-		}
-
-		// nip29 message
-		if h := event.Tags.Find("h"); h != nil {
-			if filter.Tags["h"] == nil {
-				// when a subscription doesn't specify the "h" tag, don't send them messages from nip29 groups
-				return true
-			} else {
-				// (because we're checking event by event here, if there are kinds in the filter we assume this matches)
-				// now even if they specify these we have to check if they can read
-				if group := groups.State.GetGroupFromEvent(event); group == nil {
-					log.Warn().Stringer("event", event).Msg("unexpected group not found")
-					return true
-				} else if group.Private {
-					return !group.AnyOfTheseIsAMember(ws.AuthedPublicKeys)
-				} else {
-					return false
-				}
-			}
+		if groups.State.ShouldPreventBroadcast(event, filter, ws.AuthedPublicKeys) {
+			return true
 		}
 	}
 
 	// main relay logic:
 	// if there is a paywall check for it here
-	if global.Settings.Paywall.AmountSats > 0 && global.Settings.Paywall.PeriodDays > 0 {
-		if nip70.IsProtected(event) && (global.Settings.Paywall.Tag == "" || event.Tags.FindWithValue("t", global.Settings.Paywall.Tag) != nil) {
+	if global.Settings.Paywall.Enabled {
+		if nip70.IsProtected(event) && event.Tags.Has("nip63") {
 			// this is a paywalled event, check if reader can read
 			for _, pk := range ws.AuthedPublicKeys {
-				if global.CanReadPaywalled(event.PubKey, pk) {
+				if paywall.CanRead(event.PubKey, pk) {
 					// if they can read we're fine broadcasting this
 					return false
 				}
@@ -490,6 +434,53 @@ func virtualInviteValidationEvent(inviter nostr.PubKey) nostr.Event {
 	return vivevt
 }
 
+func deleteFromMain(id nostr.ID) error {
+	if err := search.Main.DeleteEvent(id); err != nil {
+		return err
+	}
+
+	return global.IL.Main.DeleteEvent(id)
+}
+
+func saveToMain(event nostr.Event) error {
+	if err := global.IL.Main.SaveEvent(event); err != nil {
+		return err
+	}
+
+	if global.Settings.Search.Enable {
+		return search.Main.IndexEvent(event)
+	} else {
+		return nil
+	}
+}
+
+func replaceOnMain(event nostr.Event) error {
+	if global.Settings.Search.Enable {
+		search.Main.Lock()
+		defer search.Main.Unlock()
+
+		filter := nostr.Filter{Kinds: []nostr.Kind{event.Kind}, Authors: []nostr.PubKey{event.PubKey}}
+		if event.Kind.IsAddressable() {
+			filter.Tags = nostr.TagMap{"d": []string{event.Tags.GetD()}}
+		}
+		for previous := range global.IL.Main.QueryEvents(filter, 10) {
+			if nostr.IsOlder(previous, event) {
+				search.Main.DeleteEvent(previous.ID)
+			}
+		}
+	}
+
+	if err := global.IL.Main.ReplaceEvent(event); err != nil {
+		return err
+	}
+
+	if global.Settings.Search.Enable {
+		return search.Main.IndexEvent(event)
+	} else {
+		return nil
+	}
+}
+
 // splits the query between the main relay and the groups relay
 func queryStored(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event] {
 	// if groups is disabled just query main directly
@@ -566,4 +557,17 @@ func queryNormal(ctx context.Context, filter nostr.Filter) iter.Seq[nostr.Event]
 
 	// otherwise only query the main db
 	return queryMain(ctx, filter)
+}
+
+func handleDeleted(ctx context.Context, deleted nostr.Event) {
+	if deleted.Kind == 1163 {
+		paywall.RecomputeMemberPaywall(ctx, deleted.PubKey)
+		return
+	}
+
+	if deleted.Kind.IsReplaceable() || deleted.Kind.IsAddressable() {
+		for by := range paywall.ReferencedBy(deleted) {
+			paywall.RecomputeMemberPaywall(ctx, by)
+		}
+	}
 }

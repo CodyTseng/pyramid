@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"embed"
 	"errors"
+	"io"
 	"iter"
 	"net"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,8 +34,11 @@ import (
 	"github.com/fiatjaf/pyramid/inbox"
 	"github.com/fiatjaf/pyramid/internal"
 	"github.com/fiatjaf/pyramid/moderated"
+	"github.com/fiatjaf/pyramid/paywall"
+	"github.com/fiatjaf/pyramid/personal"
 	"github.com/fiatjaf/pyramid/popular"
 	"github.com/fiatjaf/pyramid/pyramid"
+	"github.com/fiatjaf/pyramid/search"
 	"github.com/fiatjaf/pyramid/uppermost"
 )
 
@@ -45,15 +51,25 @@ var (
 var static embed.FS
 
 func main() {
+	log.Info().Str("version", currentVersion).Msg("running pyramid")
+
 	if err := global.Init(); err != nil {
 		log.Fatal().Err(err).Msg("couldn't initialize")
 		return
 	}
+	if global.Settings.Search.Enable {
+		if err := search.Init(); err != nil {
+			log.Fatal().Err(err).Msg("couldn't initialize search")
+			return
+		}
+	}
+	defer groups.ShutdownEmbeddedLiveKit()
 	defer global.End()
+	defer search.End()
 
 	// stuff we have to initialize
 	fillInRelevantUsersMapping()
-	slices.Sort(supportedKindsDefault)
+	slices.Sort(global.SupportedKindsDefault)
 	slices.Sort(global.Settings.AllowedKinds)
 
 	// start periodic version checking
@@ -88,6 +104,9 @@ func main() {
 	relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain
 	relay.Negentropy = true
 
+	// cache pinned event at startup
+	global.CachePinnedEvent(global.RelayMain)
+
 	// init sdk
 	global.Nostr = sdk.NewSystem()
 	global.Nostr.Store = global.IL.System
@@ -103,11 +122,13 @@ func main() {
 	// init basic http routes
 	relay.Router().HandleFunc("/action", actionHandler)
 	relay.Router().HandleFunc("/settings", settingsHandler)
+	relay.Router().HandleFunc("/search/reindex", search.StreamingReindexHTML)
 	relay.Router().HandleFunc("/u", memberPageHandler)
 	relay.Router().HandleFunc("/u/{pubkey}", memberPageHandler)
 	relay.Router().HandleFunc("/u/sync", syncHandler)
 	relay.Router().HandleFunc("/stats", statsHandler)
 	relay.Router().HandleFunc("/update", updateHandler)
+	relay.Router().HandleFunc("/restart", restartHandler)
 	relay.Router().HandleFunc("/icon/{relayId}", iconHandler)
 	relay.Router().HandleFunc("/forum/", forumHandler)
 	relay.Router().HandleFunc("/.well-known/nostr.json", nip05Handler)
@@ -125,9 +146,11 @@ func main() {
 	grasp.Init(relay)
 	groups.Init(relay)
 	blossom.Init(relay)
+	paywall.Init(relay)
 	favorites.Init()
 	inbox.Init()
 	internal.Init()
+	personal.Init()
 	moderated.Init()
 	popular.Init()
 	uppermost.Init()
@@ -150,7 +173,7 @@ func main() {
 			return global.IL.Scheduled.SaveEvent(event)
 		} else {
 			// normal logic
-			return global.IL.Main.SaveEvent(event)
+			return saveToMain(event)
 		}
 	}
 	relay.ReplaceEvent = func(ctx context.Context, event nostr.Event) error {
@@ -159,15 +182,19 @@ func main() {
 			return global.IL.Groups.ReplaceEvent(event)
 		} else {
 			// normal logic
-			return global.IL.Main.ReplaceEvent(event)
+			return replaceOnMain(event)
 		}
 	}
 	relay.DeleteEvent = func(ctx context.Context, id nostr.ID) error {
 		// try to delete from everywhere
-		if err := global.IL.Main.DeleteEvent(id); err != nil {
+		if err := deleteFromMain(id); err != nil {
 			return err
 		}
-		// TODO: prevent deleting from group if too much time has passed
+		for evt := range global.IL.Groups.QueryEvents(nostr.Filter{IDs: []nostr.ID{id}}, 1) {
+			if evt.CreatedAt < nostr.Now()-60*60*2 /* 2 hours */ {
+				return errors.New("can't delete very old group message")
+			}
+		}
 		if err := global.IL.Groups.DeleteEvent(id); err != nil {
 			return err
 		}
@@ -185,13 +212,20 @@ func main() {
 		func(ctx context.Context, id nostr.ID) error {
 			return global.IL.Main.DeleteEvent(id)
 		},
+		func(ctx context.Context, evt nostr.Event) {
+			if relay.OnEventDeleted != nil {
+				relay.OnEventDeleted(ctx, evt)
+			}
+		},
 	)
 
 	relay.OnRequest = policies.SeqRequest(
 		policies.NoComplexFilters,
-		policies.NoSearchQueries,
-		policies.FilterIPRateLimiter(20, time.Minute, 100),
 		func(ctx context.Context, filter nostr.Filter) (bool, string) {
+			if !global.Settings.Search.Enable && filter.Search != "" {
+				return true, "search is disabled"
+			}
+
 			if filter.Tags["h"] != nil {
 				// nip29 logic
 				if global.Settings.Groups.Enabled {
@@ -216,7 +250,6 @@ func main() {
 			return rejectInviteRequestsNonAuthed(ctx, filter)
 		},
 	)
-	relay.RejectConnection = policies.ConnectionRateLimiter(1, time.Minute*5, 30)
 	relay.OnEvent = func(ctx context.Context, event nostr.Event) (reject bool, msg string) {
 		if len(event.Content) > global.Settings.MaxEventSize {
 			return true, "content is too big"
@@ -246,8 +279,10 @@ func main() {
 			// normal logic
 			return policies.SeqEvent(
 				policies.PreventTooManyIndexableTags(9, []nostr.Kind{3}, nil),
-				policies.PreventTooManyIndexableTags(1200, nil, []nostr.Kind{3}),
+				policies.PreventTooManyIndexableTags(1400, nil, []nostr.Kind{3}),
 				policies.RejectUnprefixedNostrReferences,
+				grasp.RejectIncomingEvent,
+				policies.PreventNormalDuplicates(global.IL.Main.QueryEvents),
 				basicRejectionLogic,
 			)(ctx, event)
 		}
@@ -256,26 +291,39 @@ func main() {
 	relay.OnEventSaved = func(ctx context.Context, event nostr.Event) {
 		if h := event.Tags.Find("h"); h != nil {
 			// nip29 logic
-			groups.State.ProcessEvent(ctx, event)
+			groups.State.HandleEventSaved(event)
 			return
 		}
 
 		// normal logic
 		switch event.Kind {
-		case 6, 7, 9321, 9735, 9802, 1, 1111:
+		case 6, 7, 9321, 9735, 9802, 1, 1111, 1244:
 			processReactions(ctx, event)
 		case 0, 3, 10019:
 			global.IL.System.SaveEvent(event)
+		case 1163:
+			// NIP-63 paywall event - already handled in basicRejectionLogic
+			// recompute user paywall to ensure consistency
+			paywall.RecomputeMemberPaywall(ctx, event.PubKey)
+		}
+
+		// any replaceable event can potentially be referenced by a paywall
+		if event.Kind.IsReplaceable() || event.Kind.IsAddressable() {
+			for by := range paywall.ReferencedBy(event) {
+				paywall.RecomputeMemberPaywall(ctx, by)
+			}
 		}
 
 		// trigger opentimestamping of selected event kinds
 		if global.Settings.EnableOTS {
 			switch event.Kind {
-			case 1, 11, 1111, 20, 21, 22, 24, 9802:
+			case 1, 11, 1111, 1222, 1244, 20, 21, 22, 24, 9802:
 				go triggerOTS(ctx, event)
 			}
 		}
 	}
+
+	relay.OnEventDeleted = handleDeleted
 
 	relay.OnEphemeralEvent = func(ctx context.Context, event nostr.Event) {
 		switch event.Kind {
@@ -289,13 +337,6 @@ func main() {
 	relay.OnConnect = onConnect
 	relay.PreventBroadcast = preventBroadcast
 
-	relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, 43)
-	if global.Settings.Groups.Enabled {
-		relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, 29)
-	}
-	if global.Settings.AcceptScheduledEvents {
-		relay.Info.SupportedNIPs = append(relay.Info.SupportedNIPs, 16)
-	}
 	relay.ManagementAPI.AllowPubKey = allowPubKeyHandler
 	relay.ManagementAPI.BanEvent = banEventHandler
 	relay.ManagementAPI.BanPubKey = banPubKeyHandler
@@ -311,11 +352,26 @@ func main() {
 	relay.ManagementAPI.BlockIP = blockIPHandler
 	relay.ManagementAPI.UnblockIP = unblockIPHandler
 	relay.OverwriteRelayInformation = func(ctx context.Context, r *http.Request, info nip11.RelayInformationDocument) nip11.RelayInformationDocument {
+		// prevent flotilla from doing its negentropy here as it is incompatible with our groups approach
 		if strings.Contains(r.Header.Get("User-Agent"), "aiohttp") || strings.Contains(r.Referer(), "flotilla") {
 			if idx := slices.Index(info.SupportedNIPs, 77); idx != -1 {
 				info.SupportedNIPs[idx] = info.SupportedNIPs[len(info.SupportedNIPs)-1]
 				info.SupportedNIPs = info.SupportedNIPs[0 : len(info.SupportedNIPs)-1]
 			}
+		}
+
+		info.SupportedNIPs = append(info.SupportedNIPs, 43)
+		if global.Settings.Search.Enable {
+			info.SupportedNIPs = append(info.SupportedNIPs, 50)
+		}
+		if global.Settings.Groups.Enabled {
+			info.SupportedNIPs = append(info.SupportedNIPs, 29)
+		}
+		if global.Settings.AcceptScheduledEvents {
+			info.SupportedNIPs = append(info.SupportedNIPs, 16)
+		}
+		if global.Settings.Paywall.Enabled {
+			info.SupportedNIPs = append(info.SupportedNIPs, 63)
 		}
 
 		pk := global.Settings.RelayInternalSecretKey.Public()
@@ -330,6 +386,7 @@ func main() {
 			RestrictedWrites: true,
 		}
 		info.Software = "https://github.com/fiatjaf/pyramid"
+		info.Version = currentVersion
 		return info
 	}
 
@@ -353,27 +410,31 @@ var (
 
 func restartSoon() {
 	log.Info().Msg("restarting in 1 second")
+	groups.ShutdownEmbeddedLiveKit()
 	time.Sleep(time.Second * 1)
 	cancelStartContext(restarting)
 }
 
 func start() {
-	var ctx context.Context
-	ctx, cancelStartContext = context.WithCancelCause(context.Background())
+	for {
+		var ctx context.Context
+		ctx, cancelStartContext = context.WithCancelCause(context.Background())
 
-	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+		ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 
-	if err := run(ctx); err != nil {
-		if context.Cause(ctx) != restarting {
-			log.Debug().Err(err).Msg("exit reason")
-			return
+		err := run(ctx)
+		cause := context.Cause(ctx)
+		cancel()
+
+		if cause == restarting {
+			// start again
+			continue
 		}
-	}
 
-	// restart if it was a restart request
-	if context.Cause(ctx) == restarting {
-		start()
+		if err != nil {
+			log.Debug().Err(err).Msg("exit reason")
+		}
+		return
 	}
 }
 
@@ -382,6 +443,9 @@ func run(ctx context.Context) error {
 
 	mux.Handle("/"+global.Settings.Internal.HTTPBasePath+"/", internal.Relay)
 	mux.Handle("/"+global.Settings.Internal.HTTPBasePath, internal.Relay)
+
+	mux.Handle("/"+global.Settings.Personal.HTTPBasePath+"/", personal.Relay)
+	mux.Handle("/"+global.Settings.Personal.HTTPBasePath, personal.Relay)
 
 	mux.Handle("/"+global.Settings.Favorites.HTTPBasePath+"/", favorites.Relay)
 	mux.Handle("/"+global.Settings.Favorites.HTTPBasePath, favorites.Relay)
@@ -394,6 +458,7 @@ func run(ctx context.Context) error {
 
 	mux.Handle("/groups/", groups.Handler)
 	mux.Handle("/groups", groups.Handler)
+	mux.Handle("/.well-known/nip29/", groups.Handler)
 
 	mux.Handle("/"+global.Settings.Inbox.HTTPBasePath+"/", inbox.Relay)
 	mux.Handle("/"+global.Settings.Inbox.HTTPBasePath, inbox.Relay)
@@ -407,10 +472,30 @@ func run(ctx context.Context) error {
 	mux.Handle("/"+global.Settings.Moderated.HTTPBasePath+"/", moderated.Relay)
 	mux.Handle("/"+global.Settings.Moderated.HTTPBasePath, moderated.Relay)
 
+	mux.Handle("/paywall/", paywall.Handler)
+	mux.Handle("/paywall", paywall.Handler)
+
 	mux.Handle("/scheduled/", scheduled)
 	mux.Handle("/scheduled", scheduled)
 
 	mux.Handle("/", relay)
+	mainHandler := setupCheckMiddleware(mux)
+	externalHandler := ipBlockMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := strings.TrimSpace(r.Host)
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.ToLower(host)
+
+		// proxy to livekit server via subdomain
+		if groups.EmbeddedLiveKitAvailable() && host == strings.ToLower("livekit."+global.Settings.Domain) {
+			groups.LiveKitProxyHandler(w, r)
+			return
+		}
+
+		// otherwise handle normally
+		mainHandler.ServeHTTP(w, r)
+	}))
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -427,7 +512,7 @@ func run(ctx context.Context) error {
 
 	server := &http.Server{
 		Addr:    global.S.Host + ":" + port,
-		Handler: ipBlockMiddleware(setupCheckMiddleware(mux)),
+		Handler: externalHandler,
 		BaseContext: func(_ net.Listener) context.Context {
 			return ctx
 		},
@@ -435,36 +520,150 @@ func run(ctx context.Context) error {
 
 	if port == "443" {
 		manager := &autocert.Manager{
-			Prompt:     func(_ string) bool { return true },
-			HostPolicy: autocert.HostWhitelist(global.Settings.Domain),
-			Cache:      autocert.DirCache("certs"),
+			Prompt: func(_ string) bool { return true },
+			HostPolicy: autocert.HostWhitelist(
+				global.Settings.Domain,
+				"livekit."+global.Settings.Domain,
+				"turn."+global.Settings.Domain,
+			),
+			Cache: autocert.DirCache("certs"),
 		}
 
 		// HTTP server on 80 for ACME challenges and user access
 		httpServer := &http.Server{
 			Addr:    global.S.Host + ":80",
-			Handler: manager.HTTPHandler(mux),
+			Handler: manager.HTTPHandler(externalHandler),
 			BaseContext: func(_ net.Listener) context.Context {
 				return ctx
 			},
 		}
 		g.Go(func() error { return httpServer.ListenAndServe() })
 
+		tlsConfig := manager.TLSConfig()
+		origGetCert := tlsConfig.GetCertificate
+		tlsConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hello.ServerName == "" {
+				// when SNI is missing, use the configured domain.
+				// since Pyramid serves a single domain, there is no ambiguity — we can safely serve its certificate.
+				// see https://github.com/fiatjaf/pyramid/issues/14
+				hello.ServerName = global.Settings.Domain
+			}
+			return origGetCert(hello)
+		}
+
 		// HTTPS server on 443
 		httpsServer := &http.Server{
-			Addr:    global.S.Host + ":443",
-			Handler: ipBlockMiddleware(mux),
+			Addr:      global.S.Host + ":443",
+			Handler:   externalHandler,
+			TLSConfig: tlsConfig,
 			BaseContext: func(_ net.Listener) context.Context {
 				return ctx
 			},
 		}
-		httpsServer.TLSConfig = manager.TLSConfig()
 
-		g.Go(func() error { return httpsServer.ListenAndServeTLS("", "") })
+		livekitServer := &http.Server{
+			Handler: http.HandlerFunc(groups.LiveKitProxyHandler),
+			BaseContext: func(_ net.Listener) context.Context {
+				return ctx
+			},
+		}
+
+		tlsListener := newConnListener(&net.TCPAddr{IP: net.ParseIP(global.S.Host), Port: 443})
+		livekitTLSListener := newConnListener(&net.TCPAddr{IP: net.ParseIP(global.S.Host), Port: 443})
+
+		listener, err := net.Listen("tcp", global.S.Host+":443")
+		if err != nil {
+			return err
+		}
+
+		// accept raw TCP on 443, terminate TLS, then route by SNI
+		g.Go(func() error {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					return err
+				}
+
+				go func(conn net.Conn) {
+					tlsConn := tls.Server(conn, tlsConfig)
+					if err := tlsConn.Handshake(); err != nil {
+						conn.Close()
+						return
+					}
+
+					serverName := strings.ToLower(tlsConn.ConnectionState().ServerName)
+					if serverName == "" {
+						serverName = strings.ToLower(global.Settings.Domain)
+					}
+
+					switch serverName {
+					case "turn." + strings.ToLower(global.Settings.Domain):
+						if !groups.EmbeddedLiveKitRunning() {
+							tlsConn.Close()
+							return
+						}
+						defer tlsConn.Close()
+
+						backend, err := net.Dial("tcp", "0.0.0.0:5349")
+						if err != nil {
+							tlsConn.Close()
+							return
+						}
+						defer backend.Close()
+
+						errCh := make(chan error, 2)
+						go func() {
+							_, err := io.Copy(backend, tlsConn)
+							errCh <- err
+						}()
+						go func() {
+							_, err := io.Copy(tlsConn, backend)
+							errCh <- err
+						}()
+						<-errCh
+						return
+					case "livekit." + strings.ToLower(global.Settings.Domain):
+						if err := livekitTLSListener.Enqueue(ctx, tlsConn); err != nil {
+							tlsConn.Close()
+						}
+						return
+					default:
+						if err := tlsListener.Enqueue(ctx, tlsConn); err != nil {
+							tlsConn.Close()
+						}
+						return
+					}
+				}(conn)
+			}
+		})
+
+		g.Go(func() error {
+			err := httpsServer.Serve(tlsListener)
+			if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		})
+
+		g.Go(func() error {
+			err := livekitServer.Serve(livekitTLSListener)
+			if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		})
+
 		log.Info().Msg("running on https://" + global.S.Host + ":443 and http://" + global.S.Host + ":80")
 		g.Go(func() error {
 			<-ctx.Done()
+			listener.Close()
+			tlsListener.Close()
+			livekitTLSListener.Close()
 			httpsServer.Shutdown(context.Background())
+			livekitServer.Shutdown(context.Background())
 			httpServer.Shutdown(context.Background())
 			return nil
 		})
@@ -506,4 +705,45 @@ func setupCheckMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+type connListener struct {
+	addr      net.Addr
+	conns     chan net.Conn
+	closeOnce sync.Once
+}
+
+func newConnListener(addr net.Addr) *connListener {
+	return &connListener{
+		addr:  addr,
+		conns: make(chan net.Conn, 32),
+	}
+}
+
+func (l *connListener) Accept() (net.Conn, error) {
+	conn, ok := <-l.conns
+	if !ok {
+		return nil, net.ErrClosed
+	}
+	return conn, nil
+}
+
+func (l *connListener) Close() error {
+	l.closeOnce.Do(func() {
+		close(l.conns)
+	})
+	return nil
+}
+
+func (l *connListener) Addr() net.Addr {
+	return l.addr
+}
+
+func (l *connListener) Enqueue(ctx context.Context, conn net.Conn) error {
+	select {
+	case l.conns <- conn:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
