@@ -22,7 +22,7 @@ var (
 )
 
 func Init() {
-	Relay = khatru.NewRelay()
+	Relay = global.NewRelay()
 
 	if global.Settings.Moderated.Enabled {
 		setupEnabled()
@@ -44,7 +44,7 @@ func setupDisabled() {
 }
 
 func setupEnabled() {
-	Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Moderated.HTTPBasePath
+	Relay.ServiceURL = global.Settings.Moderated.GetServiceURL()
 
 	pk := global.Settings.RelayInternalSecretKey.Public()
 	Relay.Info.Self = &pk
@@ -78,7 +78,8 @@ func setupEnabled() {
 		return global.IL.ModerationQueue.SaveEvent(event)
 	}
 	Relay.ReplaceEvent = func(ctx context.Context, event nostr.Event) error {
-		return global.IL.ModerationQueue.ReplaceEvent(event)
+		_, err := global.IL.ModerationQueue.ReplaceEvent(event)
+		return err
 	}
 	Relay.DeleteEvent = func(ctx context.Context, id nostr.ID) error {
 		return global.IL.ModerationQueue.DeleteEvent(id)
@@ -88,14 +89,18 @@ func setupEnabled() {
 		policies.NoComplexFilters,
 		policies.NoSearchQueries,
 		policies.FilterIPRateLimiter(20, time.Minute, 100),
+		global.RejectTooManyOpenSubscriptions,
 	)
 
 	Relay.OnEvent = policies.SeqEvent(
-		policies.PreventLargeContent(10000),
-		policies.PreventTooManyIndexableTags(9, []nostr.Kind{3}, nil),
-		policies.PreventTooManyIndexableTags(1200, nil, []nostr.Kind{3}),
-		policies.RestrictToSpecifiedKinds(true, global.GetAllowedKinds()...),
+		policies.PreventLargeContent(global.Settings.Limits.MaxEventSize),
+		policies.PreventTooManyIndexableTags(15, []nostr.Kind{3}, nil),
+		policies.PreventTooManyIndexableTags(1400, nil, []nostr.Kind{3}),
 		func(ctx context.Context, evt nostr.Event) (bool, string) {
+			if !global.KindIsAllowed(evt.Kind) {
+				return true, "blocked: kind unallowed"
+			}
+
 			if global.Settings.Moderated.MinPoW > 0 {
 				difficulty := nip13.Difficulty(evt.ID)
 				if uint(difficulty) < global.Settings.Moderated.MinPoW {
@@ -136,7 +141,7 @@ func enableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupEnabled()
-	http.Redirect(w, r, "/"+global.Settings.Moderated.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Moderated.GetPageURL(), 302)
 }
 
 func disableHandler(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +160,7 @@ func disableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupDisabled()
-	http.Redirect(w, r, "/"+global.Settings.Moderated.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Moderated.GetPageURL(), 302)
 }
 
 func moderatedPageHandler(w http.ResponseWriter, r *http.Request) {

@@ -13,7 +13,6 @@ import (
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/khatru/policies"
 	"fiatjaf.com/nostr/nip11"
-	"fiatjaf.com/nostr/nip86"
 
 	"github.com/fiatjaf/pyramid/global"
 	"github.com/fiatjaf/pyramid/pyramid"
@@ -25,7 +24,10 @@ var (
 )
 
 func Init() {
-	Relay = khatru.NewRelay()
+	Relay = global.NewRelay()
+
+	slices.Sort(supportedKindsDefault)
+	initAllowedKinds()
 
 	if global.Settings.Inbox.Enabled {
 		// relay enabled
@@ -49,7 +51,7 @@ func setupDisabled() {
 }
 
 func setupEnabled() {
-	Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Inbox.HTTPBasePath
+	Relay.ServiceURL = global.Settings.Inbox.GetServiceURL()
 
 	Relay.ManagementAPI.ChangeRelayName = changeRelayNameHandler
 	Relay.ManagementAPI.ChangeRelayDescription = changeRelayDescriptionHandler
@@ -104,11 +106,13 @@ func setupEnabled() {
 		}
 	}
 	Relay.ReplaceEvent = func(ctx context.Context, event nostr.Event) error {
+		var err error
 		if slices.Contains(secretKinds, event.Kind) {
-			return global.IL.Secret.ReplaceEvent(event)
+			_, err = global.IL.Secret.ReplaceEvent(event)
 		} else {
-			return global.IL.Inbox.ReplaceEvent(event)
+			_, err = global.IL.Inbox.ReplaceEvent(event)
 		}
+		return err
 	}
 	Relay.DeleteEvent = func(ctx context.Context, id nostr.ID) error {
 		// TODO: allow deleting messages received
@@ -130,6 +134,7 @@ func setupEnabled() {
 		policies.NoComplexFilters,
 		policies.NoSearchQueries,
 		policies.FilterIPRateLimiter(20, time.Minute, 100),
+		global.RejectTooManyOpenSubscriptions,
 		rejectFilter,
 	)
 	Relay.OnEvent = policies.SeqEvent(
@@ -192,7 +197,7 @@ func enableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupEnabled()
-	http.Redirect(w, r, "/"+global.Settings.Inbox.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Inbox.GetPageURL(), 302)
 }
 
 func disableHandler(w http.ResponseWriter, r *http.Request) {
@@ -211,111 +216,7 @@ func disableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupDisabled()
-	http.Redirect(w, r, "/"+global.Settings.Inbox.HTTPBasePath+"/", 302)
-}
-
-func changeRelayNameHandler(ctx context.Context, name string) error {
-	author, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return fmt.Errorf("not authenticated")
-	}
-
-	if !pyramid.IsRoot(author) {
-		return fmt.Errorf("unauthorized")
-	}
-
-	global.Settings.Inbox.Name = name
-	return global.SaveUserSettings()
-}
-
-func changeRelayDescriptionHandler(ctx context.Context, description string) error {
-	author, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return fmt.Errorf("not authenticated")
-	}
-
-	if !pyramid.IsRoot(author) {
-		return fmt.Errorf("unauthorized")
-	}
-
-	global.Settings.Inbox.Description = description
-	return global.SaveUserSettings()
-}
-
-func changeRelayIconHandler(ctx context.Context, icon string) error {
-	author, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return fmt.Errorf("not authenticated")
-	}
-
-	if !pyramid.IsRoot(author) {
-		return fmt.Errorf("unauthorized")
-	}
-
-	global.Settings.Inbox.Icon = icon
-	return global.SaveUserSettings()
-}
-
-func listBannedPubkeysHandler(ctx context.Context) ([]nip86.PubKeyReason, error) {
-	author, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return nil, fmt.Errorf("not authenticated")
-	}
-
-	if !pyramid.IsRoot(author) {
-		return nil, fmt.Errorf("unauthorized")
-	}
-
-	var result []nip86.PubKeyReason
-	for _, pubkey := range global.Settings.Inbox.SpecificallyBlocked {
-		result = append(result, nip86.PubKeyReason{
-			PubKey: pubkey,
-			Reason: "",
-		})
-	}
-	return result, nil
-}
-
-func banPubkeyHandler(ctx context.Context, pubkey nostr.PubKey, reason string) error {
-	author, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return fmt.Errorf("not authenticated")
-	}
-
-	if !pyramid.IsRoot(author) {
-		return fmt.Errorf("unauthorized")
-	}
-
-	// check if already banned
-	for _, p := range global.Settings.Inbox.SpecificallyBlocked {
-		if p == pubkey {
-			return nil // already banned
-		}
-	}
-
-	global.Settings.Inbox.SpecificallyBlocked = append(global.Settings.Inbox.SpecificallyBlocked, pubkey)
-	return global.SaveUserSettings()
-}
-
-func allowPubkeyHandler(ctx context.Context, pubkey nostr.PubKey, reason string) error {
-	author, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return fmt.Errorf("not authenticated")
-	}
-
-	if !pyramid.IsRoot(author) {
-		return fmt.Errorf("unauthorized")
-	}
-
-	// remove from list
-	var newList []nostr.PubKey
-	for _, p := range global.Settings.Inbox.SpecificallyBlocked {
-		if p != pubkey {
-			newList = append(newList, p)
-		}
-	}
-	global.Settings.Inbox.SpecificallyBlocked = newList
-	return global.SaveUserSettings()
+	http.Redirect(w, r, global.Settings.Inbox.GetPageURL(), 302)
 }
 
 func checkWoTHandler(w http.ResponseWriter, r *http.Request) {
@@ -335,52 +236,4 @@ func checkWoTHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, fmt.Sprint(aggregatedWoT.Contains(pk)))
-}
-
-func banEventHandler(ctx context.Context, id nostr.ID, reason string) error {
-	caller, ok := khatru.GetAuthed(ctx)
-	if !ok {
-		return fmt.Errorf("not authenticated")
-	}
-
-	// allow if caller is a root user
-	if pyramid.IsRoot(caller) {
-		log.Info().Str("caller", caller.Hex()).Str("id", id.Hex()).Str("reason", reason).Msg("inbox banevent called by root")
-	} else {
-		// check if the caller is the author of the event being banned
-		var isAuthorOrRecipient bool
-		for evt := range global.IL.Inbox.QueryEvents(nostr.Filter{IDs: []nostr.ID{id}}, 1) {
-			if evt.PubKey == caller {
-				isAuthorOrRecipient = true
-				break
-			} else if evt.Tags.FindWithValue("p", caller.Hex()) != nil ||
-				evt.Tags.FindWithValue("P", caller.Hex()) != nil {
-				isAuthorOrRecipient = true
-			}
-		}
-		if !isAuthorOrRecipient {
-			for evt := range global.IL.Secret.QueryEvents(nostr.Filter{IDs: []nostr.ID{id}}, 1) {
-				if evt.PubKey == caller {
-					isAuthorOrRecipient = true
-					break
-				} else if evt.Tags.FindWithValue("p", caller.Hex()) != nil ||
-					evt.Tags.FindWithValue("P", caller.Hex()) != nil {
-					isAuthorOrRecipient = true
-				}
-			}
-		}
-		if !isAuthorOrRecipient {
-			return fmt.Errorf("must be a root user, the event author or the event recipient to ban an event")
-		}
-		log.Info().Str("caller", caller.Hex()).Str("id", id.Hex()).Str("reason", reason).Msg("inbox banevent called by author or recipient")
-	}
-
-	// Delete from both database layers
-	if err := global.IL.Inbox.DeleteEvent(id); err != nil {
-		return err
-	}
-	if err := global.IL.Secret.DeleteEvent(id); err != nil {
-		return err
-	}
-	return nil
 }

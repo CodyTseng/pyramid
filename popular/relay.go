@@ -21,7 +21,7 @@ var (
 )
 
 func Init() {
-	Relay = khatru.NewRelay()
+	Relay = global.NewRelay()
 
 	if global.Settings.Popular.Enabled {
 		// relay enabled
@@ -45,9 +45,7 @@ func setupDisabled() {
 }
 
 func setupEnabled() {
-	db := global.IL.Popular
-
-	Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Popular.HTTPBasePath
+	Relay.ServiceURL = global.Settings.Popular.GetServiceURL()
 
 	Relay.ManagementAPI.ChangeRelayName = changeRelayNameHandler
 	Relay.ManagementAPI.ChangeRelayDescription = changeRelayDescriptionHandler
@@ -66,7 +64,7 @@ func setupEnabled() {
 	// cache pinned event at startup
 	global.CachePinnedEvent(global.RelayPopular)
 
-	Relay.UseEventstore(db, 500)
+	Relay.UseEventstore(global.IL.Popular, 500)
 
 	// use custom QueryStored with pinned event support
 	Relay.QueryStored = global.QueryStoredWithPinned(global.RelayPopular)
@@ -79,6 +77,7 @@ func setupEnabled() {
 		policies.NoComplexFilters,
 		policies.NoSearchQueries,
 		policies.FilterIPRateLimiter(20, time.Minute, 100),
+		global.RejectTooManyOpenSubscriptions,
 	)
 
 	Relay.OnEvent = func(ctx context.Context, evt nostr.Event) (bool, string) {
@@ -110,7 +109,7 @@ func enableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupEnabled()
-	http.Redirect(w, r, "/"+global.Settings.Popular.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Popular.GetPageURL(), 302)
 }
 
 func disableHandler(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +128,7 @@ func disableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupDisabled()
-	http.Redirect(w, r, "/"+global.Settings.Popular.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Popular.GetPageURL(), 302)
 }
 
 func changeRelayNameHandler(ctx context.Context, name string) error {

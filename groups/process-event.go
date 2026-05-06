@@ -23,7 +23,7 @@ func (s *GroupsState) ProcessEvent(ctx context.Context, event nostr.Event) (grou
 			group = s.NewGroup(groupId)
 			s.Groups.Store(groupId, group)
 
-			nostr.AppendUnique(groupsAffected, group)
+			groupsAffected = nostr.AppendUnique(groupsAffected, group)
 
 			// create a put-user event for the creator to ensure membership is recorded
 			addCreator := nostr.Event{
@@ -44,13 +44,13 @@ func (s *GroupsState) ProcessEvent(ctx context.Context, event nostr.Event) (grou
 			}
 
 			for _, affected := range s.ProcessEvent(ctx, addCreator) {
-				nostr.AppendUnique(groupsAffected, affected)
+				groupsAffected = nostr.AppendUnique(groupsAffected, affected)
 			}
 
 			s.broadcast(addCreator)
 		} else {
 			group = s.GetGroupFromEvent(event)
-			nostr.AppendUnique(groupsAffected, group)
+			groupsAffected = nostr.AppendUnique(groupsAffected, group)
 		}
 
 		// apply the moderation action
@@ -68,12 +68,19 @@ func (s *GroupsState) ProcessEvent(ctx context.Context, event nostr.Event) (grou
 				if err := s.DB.DeleteEvent(id); err != nil {
 					log.Warn().Err(err).Stringer("event", id).Msg("failed to delete")
 				} else {
+					if err := group.deleteEventFromSearch(id); err != nil {
+						log.Warn().Err(err).Stringer("event", id).Str("groupId", group.Address.ID).Msg("failed to delete event from group search index")
+					}
+
 					idx := s.deletedCacheIndex.Add(1) % uint32(len(s.deletedCache))
 					s.deletedCache[idx] = id
 				}
 			}
 		} else if event.Kind == nostr.KindSimpleGroupDeleteGroup {
 			// when the group was deleted we just remove it
+			if err := group.removeSearchIndex(); err != nil {
+				log.Error().Err(err).Str("groupId", group.Address.ID).Msg("failed to remove group search index")
+			}
 			s.Groups.Delete(group.Address.ID)
 		}
 	}
@@ -112,7 +119,7 @@ func (s *GroupsState) ProcessEvent(ctx context.Context, event nostr.Event) (grou
 		}
 
 		for _, affected := range s.ProcessEvent(ctx, addUser) {
-			nostr.AppendUnique(groupsAffected, affected)
+			groupsAffected = nostr.AppendUnique(groupsAffected, affected)
 		}
 
 		s.broadcast(addUser)
@@ -142,7 +149,7 @@ func (s *GroupsState) ProcessEvent(ctx context.Context, event nostr.Event) (grou
 			}
 
 			for _, affected := range s.ProcessEvent(ctx, removeUser) {
-				nostr.AppendUnique(groupsAffected, affected)
+				groupsAffected = nostr.AppendUnique(groupsAffected, affected)
 			}
 
 			s.broadcast(removeUser)

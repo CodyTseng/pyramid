@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -43,7 +45,15 @@ func inviteTreeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	inviteTreePage(loggedUser, nip05Names).Render(r.Context(), w)
+	onlinePubkeys := map[nostr.PubKey]struct{}{}
+	for evt := range global.IL.Main.QueryEvents(nostr.Filter{
+		Since: nostr.Now() - 60*10,
+		Kinds: []nostr.Kind{1},
+	}, 1000) {
+		onlinePubkeys[evt.PubKey] = struct{}{}
+	}
+
+	inviteTreePage(loggedUser, nip05Names, onlinePubkeys).Render(r.Context(), w)
 }
 
 func actionHandler(w http.ResponseWriter, r *http.Request) {
@@ -135,17 +145,28 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					global.Settings.MaxInvitesAtEachLevel = nil
 				}
 			case "max_event_size":
-				global.Settings.MaxEventSize, _ = strconv.Atoi(v[0])
+				global.Settings.Limits.MaxEventSize, _ = strconv.Atoi(v[0])
+			case "max_subscriptions_open":
+				global.Settings.Limits.MaxSubscriptionsOpen, _ = strconv.Atoi(v[0])
+			case "max_total_cost_open":
+				global.Settings.Limits.MaxTotalCostOpen, _ = strconv.Atoi(v[0])
 			case "browse_uri":
 				global.Settings.BrowseURI = v[0]
 			case "link_url":
 				global.Settings.LinkURL = v[0]
 			case "require_current_timestamp":
 				global.Settings.RequireCurrentTimestamp = v[0] == "on"
-			case "enable_ots":
-				global.Settings.EnableOTS = v[0] == "on"
 			case "accept_scheduled_events":
 				global.Settings.AcceptScheduledEvents = v[0] == "on"
+			case "allow_ephemeral_from_anyone":
+				global.Settings.AllowEphemeralFromAnyone = v[0] == "on"
+			case "validate_schema":
+				enabled := v[0] == "on"
+				if err := setSchemaValidator(enabled); err != nil {
+					http.Error(w, "failed to load schema validator: "+err.Error(), 500)
+					return
+				}
+				global.Settings.ValidateSchema = enabled
 			case "custom_update_source":
 				customUpdateSource = v[0]
 				fetchLatestVersion()
@@ -198,8 +219,14 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				} else {
 					global.Settings.Search.Languages = []string{"en"}
 				}
-				// call BuildLanguageDetector() to rebuild with new languages
-				search.BuildLanguageDetector()
+
+				// restart search so new languages are used
+				search.End()
+				if err := search.Init(); err != nil {
+					http.Error(w, "failed to restart search", 500)
+					return
+				}
+
 				// update timestamp when languages change
 				if err := search.UpdateLanguagesChange(); err != nil {
 					log.Warn().Err(err).Msg("failed to update languages change timestamp")
@@ -247,8 +274,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				global.Settings.Favorites.HTTPBasePath = v[0]
-				favorites.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				favorites.Relay.ServiceURL = global.Settings.Favorites.GetServiceURL()
+				delayedRedirectTarget = global.Settings.Favorites.GetPageURL()
+				favorites.Init()
+				go restartSoon()
+			case "favorites_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Favorites.HTTPDomain = domain
+				favorites.Relay.ServiceURL = global.Settings.Favorites.GetServiceURL()
 				favorites.Init()
 				go restartSoon()
 			case "moderated_name":
@@ -263,11 +300,21 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 			case "moderated_httpBasePath":
 				if len(v[0]) > 0 {
 					global.Settings.Moderated.HTTPBasePath = v[0]
-					moderated.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-					delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+					moderated.Relay.ServiceURL = global.Settings.Moderated.GetServiceURL()
+					delayedRedirectTarget = global.Settings.Moderated.GetPageURL()
 					moderated.Init()
 					go restartSoon()
 				}
+			case "moderated_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Moderated.HTTPDomain = domain
+				moderated.Relay.ServiceURL = global.Settings.Moderated.GetServiceURL()
+				moderated.Init()
+				go restartSoon()
 			case "inbox_name":
 				global.Settings.Inbox.Name = v[0]
 			case "inbox_description":
@@ -283,8 +330,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				global.Settings.Inbox.HTTPBasePath = v[0]
-				inbox.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				inbox.Relay.ServiceURL = global.Settings.Inbox.GetServiceURL()
+				delayedRedirectTarget = global.Settings.Inbox.GetPageURL()
+				inbox.Init()
+				go restartSoon()
+			case "inbox_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Inbox.HTTPDomain = domain
+				inbox.Relay.ServiceURL = global.Settings.Inbox.GetServiceURL()
 				inbox.Init()
 				go restartSoon()
 			case "internal_name":
@@ -302,8 +359,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				global.Settings.Internal.HTTPBasePath = v[0]
-				internal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				internal.Relay.ServiceURL = global.Settings.Internal.GetServiceURL()
+				delayedRedirectTarget = global.Settings.Internal.GetPageURL()
+				internal.Init()
+				go restartSoon()
+			case "internal_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Internal.HTTPDomain = domain
+				internal.Relay.ServiceURL = global.Settings.Internal.GetServiceURL()
 				internal.Init()
 				go restartSoon()
 			case "personal_name":
@@ -318,8 +385,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				global.Settings.Personal.HTTPBasePath = v[0]
-				personal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				personal.Relay.ServiceURL = global.Settings.Personal.GetServiceURL()
+				delayedRedirectTarget = global.Settings.Personal.GetPageURL()
+				personal.Init()
+				go restartSoon()
+			case "personal_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Personal.HTTPDomain = domain
+				personal.Relay.ServiceURL = global.Settings.Personal.GetServiceURL()
 				personal.Init()
 				go restartSoon()
 			case "popular_name":
@@ -337,8 +414,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				global.Settings.Popular.HTTPBasePath = v[0]
-				popular.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				popular.Relay.ServiceURL = global.Settings.Popular.GetServiceURL()
+				delayedRedirectTarget = global.Settings.Popular.GetPageURL()
+				popular.Init()
+				go restartSoon()
+			case "popular_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Popular.HTTPDomain = domain
+				popular.Relay.ServiceURL = global.Settings.Popular.GetServiceURL()
 				popular.Init()
 				go restartSoon()
 			case "uppermost_name":
@@ -356,8 +443,18 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				global.Settings.Uppermost.HTTPBasePath = v[0]
-				uppermost.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + v[0]
-				delayedRedirectTarget = global.Settings.HTTPScheme() + global.Settings.Domain + "/" + v[0] + "/"
+				uppermost.Relay.ServiceURL = global.Settings.Uppermost.GetServiceURL()
+				delayedRedirectTarget = global.Settings.Uppermost.GetPageURL()
+				uppermost.Init()
+				go restartSoon()
+			case "uppermost_httpDomain":
+				domain, err := normalizeDomainInput(v[0])
+				if err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				global.Settings.Uppermost.HTTPDomain = domain
+				uppermost.Relay.ServiceURL = global.Settings.Uppermost.GetServiceURL()
 				uppermost.Init()
 				go restartSoon()
 				//
@@ -373,6 +470,15 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				global.Settings.Inbox.HellthreadLimit, _ = strconv.Atoi(v[0])
 			case "inbox_min_dm_pow":
 				global.Settings.Inbox.MinDMPoW, _ = strconv.Atoi(v[0])
+			case "inbox_require_auth_for_dm":
+				if v[0] == "always" || v[0] == "when_no_pow" || v[0] == "" {
+					global.Settings.Inbox.RequireAuthForDM = v[0]
+				}
+			case "inbox_allowed_kinds":
+				if err := inbox.UpdateAllowedKindsSpec(v[0]); err != nil {
+					http.Error(w, "invalid inbox_allowed_kinds: "+err.Error(), 400)
+					return
+				}
 			case "inbox_specifically_blocked":
 				var blocked []nostr.PubKey
 				for _, s := range v {
@@ -400,22 +506,15 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				//
 				// allowed kinds settings
-			case "allowed_kinds":
-				kinds := make([]nostr.Kind, 0, len(v[0])*6)
-				// split by comma and parse each kind
-				for _, s := range strings.Split(v[0], ",") {
-					if kind, err := strconv.ParseUint(strings.TrimSpace(s), 10, 16); err == nil {
-						kinds = append(kinds, nostr.Kind(kind))
-					}
+			case "allowed_kinds_spec":
+				kindIsAllowed, err := global.BuildKindIsAllowedFunction(v[0], global.SupportedKindsDefault)
+				if err != nil {
+					http.Error(w, "invalid allowed_kinds: "+err.Error(), 400)
+					return
 				}
-				// if no kinds are entered, set to nil to use the default list
 
-				if len(kinds) == 0 {
-					global.Settings.AllowedKinds = nil
-				} else {
-					global.Settings.AllowedKinds = kinds
-					slices.Sort(global.Settings.AllowedKinds)
-				}
+				global.Settings.AllowedKindsSpec = v[0]
+				global.KindIsAllowed = kindIsAllowed
 				//
 				// ftp settings
 			case "ftp_enabled":
@@ -474,6 +573,67 @@ func settingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	settingsPage(loggedUser).Render(r.Context(), w)
+}
+
+func logHandler(w http.ResponseWriter, r *http.Request) {
+	loggedUser, ok := global.GetLoggedUser(r)
+	if !ok || !pyramid.IsRoot(loggedUser) {
+		http.Error(w, "unauthorized", 403)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	_, _ = io.WriteString(w, "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>log</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,\"Liberation Mono\",\"Courier New\",monospace;margin:12px;} .line{white-space:pre;}</style></head><body>")
+
+	writeLine := func(line string) {
+		_, _ = io.WriteString(w, "<div class=\"line\">"+html.EscapeString(line)+"</div>\n")
+	}
+
+	if global.LogFilePath != "" {
+		file, err := os.Open(global.LogFilePath)
+		if err == nil {
+			scanner := bufio.NewScanner(file)
+			buf := make([]byte, 0, 64*1024)
+			scanner.Buffer(buf, 1024*1024)
+			for scanner.Scan() {
+				writeLine(scanner.Text())
+			}
+			file.Close()
+		}
+	}
+	flusher.Flush()
+
+	stream, unsubscribe := global.SubscribeLogStream(256)
+	defer unsubscribe()
+
+	var pending string
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case chunk, ok := <-stream:
+			if !ok {
+				return
+			}
+			pending += string(chunk)
+			lines := strings.Split(pending, "\n")
+			for i := 0; i < len(lines)-1; i++ {
+				writeLine(lines[i])
+			}
+			pending = lines[len(lines)-1]
+			flusher.Flush()
+		}
+	}
 }
 
 func iconHandler(w http.ResponseWriter, r *http.Request) {
@@ -596,7 +756,7 @@ func iconHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var domainRegex = regexp.MustCompile(`^((xn--|_)?[a-z0-9-]{0,61}[a-z0-9]{1,1}\.)*(xn--)?([a-z0-9][a-z0-9\-]{0,60}|[a-z0-9-]{1,30}\.[a-z]{2,})(:\d{1,5})?$`)
+var domainRegex = regexp.MustCompile(`^((xn--|_)?[a-z0-9-]{0,61}[a-z0-9]{1,1}\.)*(xn--)?([a-z0-9][a-z0-9\-]{0,60}|[a-z0-9-]{1,30}\.[a-z]{2,})?$`)
 
 func domainSetupHandler(w http.ResponseWriter, r *http.Request) {
 	if global.Settings.Domain != "" {
@@ -629,19 +789,13 @@ func domainSetupHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func setupDomain(domain string) error {
-	// trim protocol prefixes
-	domain = strings.TrimPrefix(domain, "http://")
-	domain = strings.TrimPrefix(domain, "https://")
-	domain = strings.TrimPrefix(domain, "ws://")
-	domain = strings.TrimPrefix(domain, "wss://")
-
-	// trim trailing slashes and spaces again
-	domain = strings.TrimRight(domain, "/")
-	domain = strings.TrimSpace(domain)
-
-	// validate domain only contains letters, dots, and colons
-	if !domainRegex.MatchString(domain) {
-		return fmt.Errorf("invalid domain format: only letters, dots, and colons are allowed")
+	var err error
+	domain, err = normalizeDomainInput(domain)
+	if err != nil {
+		return err
+	}
+	if domain == "" {
+		return fmt.Errorf("domain is required")
 	}
 
 	global.Settings.Domain = domain
@@ -652,13 +806,13 @@ func setupDomain(domain string) error {
 		Str("service-url", relay.ServiceURL).
 		Msg("main relay domain changed")
 
-	inbox.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Inbox.HTTPBasePath
-	favorites.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Favorites.HTTPBasePath
-	internal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Internal.HTTPBasePath
-	personal.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Personal.HTTPBasePath
-	moderated.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Moderated.HTTPBasePath
-	popular.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Popular.HTTPBasePath
-	uppermost.Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Uppermost.HTTPBasePath
+	inbox.Relay.ServiceURL = global.Settings.Inbox.GetServiceURL()
+	favorites.Relay.ServiceURL = global.Settings.Favorites.GetServiceURL()
+	internal.Relay.ServiceURL = global.Settings.Internal.GetServiceURL()
+	personal.Relay.ServiceURL = global.Settings.Personal.GetServiceURL()
+	moderated.Relay.ServiceURL = global.Settings.Moderated.GetServiceURL()
+	popular.Relay.ServiceURL = global.Settings.Popular.GetServiceURL()
+	uppermost.Relay.ServiceURL = global.Settings.Uppermost.GetServiceURL()
 
 	blossom.BlobIndex.ServiceURL = global.Settings.HTTPScheme() + global.Settings.Domain
 	if blossom.Server != nil {
@@ -776,6 +930,8 @@ func forumHandler(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
+var nip05UsernameRe = regexp.MustCompile(`^[a-z0-9_]+$`)
+
 func memberPageHandler(w http.ResponseWriter, r *http.Request) {
 	loggedUser, isLogged := global.GetLoggedUser(r)
 
@@ -783,7 +939,7 @@ func memberPageHandler(w http.ResponseWriter, r *http.Request) {
 		if nip05Username := r.PostFormValue("nip05_username"); nip05Username != "" {
 			// basic validation for NIP-05 username (alphanumeric and underscores only)
 			nip05Username = strings.ToLower(nip05Username)
-			if !regexp.MustCompile(`^[a-z0-9_]+$`).MatchString(nip05Username) {
+			if !nip05UsernameRe.MatchString(nip05Username) {
 				http.Error(w, "invalid username: only letters, numbers, and underscores are allowed", 400)
 				return
 			}

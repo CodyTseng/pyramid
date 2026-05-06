@@ -21,7 +21,7 @@ var (
 )
 
 func Init() {
-	Relay = khatru.NewRelay()
+	Relay = global.NewRelay()
 
 	if global.Settings.Favorites.Enabled {
 		// relay enabled
@@ -47,7 +47,7 @@ func setupDisabled() {
 func setupEnabled() {
 	db := global.IL.Favorites
 
-	Relay.ServiceURL = global.Settings.WSScheme() + global.Settings.Domain + "/" + global.Settings.Favorites.HTTPBasePath
+	Relay.ServiceURL = global.Settings.Favorites.GetServiceURL()
 
 	Relay.ManagementAPI.ChangeRelayName = changeRelayNameHandler
 	Relay.ManagementAPI.ChangeRelayDescription = changeRelayDescriptionHandler
@@ -79,14 +79,18 @@ func setupEnabled() {
 		policies.NoComplexFilters,
 		policies.NoSearchQueries,
 		policies.FilterIPRateLimiter(20, time.Minute, 100),
+		global.RejectTooManyOpenSubscriptions,
 	)
 
 	Relay.OnEvent = policies.SeqEvent(
-		policies.PreventLargeContent(10000),
-		policies.PreventTooManyIndexableTags(9, []nostr.Kind{3}, nil),
-		policies.PreventTooManyIndexableTags(1200, nil, []nostr.Kind{3}),
-		policies.RestrictToSpecifiedKinds(true, global.GetAllowedKinds()...),
+		policies.PreventLargeContent(global.Settings.Limits.MaxEventSize),
+		policies.PreventTooManyIndexableTags(15, []nostr.Kind{3}, nil),
+		policies.PreventTooManyIndexableTags(1400, nil, []nostr.Kind{3}),
 		func(ctx context.Context, evt nostr.Event) (bool, string) {
+			if !global.KindIsAllowed(evt.Kind) {
+				return true, "blocked: kind unallowed"
+			}
+
 			authedPublicKeys := khatru.GetAllAuthed(ctx)
 			if len(authedPublicKeys) == 0 {
 				return true, "auth-required: must be a relay member"
@@ -132,7 +136,7 @@ func enableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupEnabled()
-	http.Redirect(w, r, "/"+global.Settings.Favorites.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Favorites.GetPageURL(), 302)
 }
 
 func disableHandler(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +155,7 @@ func disableHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setupDisabled()
-	http.Redirect(w, r, "/"+global.Settings.Favorites.HTTPBasePath+"/", 302)
+	http.Redirect(w, r, global.Settings.Favorites.GetPageURL(), 302)
 }
 
 func changeRelayNameHandler(ctx context.Context, name string) error {

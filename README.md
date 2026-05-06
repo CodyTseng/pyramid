@@ -2,6 +2,10 @@
 
 **pyramid** serves as a wondrous furnace of communityzenship for your Nostr experience, enabling users to build and nurture vibrant communities through a hierarchical relay system. With powerful subrelay features, extensive optional configurations, and easy theming options, **pyramid** makes it effortless to create and manage personalized Nostr environments tailored to your personal or community's needs.
 
+## introduction
+
+if you have no idea of what pyramid is about, try reading [this guide](https://spatianostra.com/the-pyramid-community-relay/) and soon you'll be like ![](https://nostr.media/829bfab666cd2176312ae7548965e3334d08d44fbd4100c0a97bd829d70d114a.png)
+
 ## easy install
 
 type this in a blank server you just rented:
@@ -101,7 +105,7 @@ https://github.com/user-attachments/assets/3eafa97c-a7a9-4fdc-b1ea-f466dae47634
 
 - **community-linked NIP-05 nostr user addresses**
   - each member can claim their own user address by visiting the homepage
- 
+
 - **NIP-34 GRASP support**
 
 - **negentropy sync**
@@ -122,4 +126,4 @@ https://github.com/user-attachments/assets/3eafa97c-a7a9-4fdc-b1ea-f466dae47634
 
 ## community
 
-join the group of users at `pyramid.fiatjaf.com'Tnq7x2ZTgrPZWFrC` ([grimoire](https://grimoire.rocks/run?cmd=chat pyramid.fiatjaf.com')) to talk about your experience or complain about things.
+join the group of users at `pyramid.fiatjaf.com'Tnq7x2ZTgrPZWFrC` ([grimoire](https://grimoire.rocks/run?cmd=chat%20pyramid.fiatjaf.com%27Tnq7x2ZTgrPZWFrC), [Nostrord](https://web.nostrord.com/?relay=pyramid.fiatjaf.com&group=Tnq7x2ZTgrPZWFrC), [chachi](https://chachi.chat/pyramid.fiatjaf.com/Tnq7x2ZTgrPZWFrC)) to talk about your experience or complain about things.
